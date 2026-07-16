@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+nvtune-gui — GTK4 graphical front-end for nvtune (Afterburner-style).
+
+Reads live stats from nvidia-smi and drives tuning through the `nvtune` CLI,
+so the console tool and the GUI stay in sync. Shows a rolling graph and
+sliders for power limit / clock lock / offsets / fan, plus profiles and the
+MangoHud in-game overlay toggle.
+"""
+import os
+import shutil
+import subprocess
+from collections import deque
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
+
+NVTUNE = shutil.which("nvtune") or str(Path.home() / "nvtune" / "nvtune")
+PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
+GPU = 0
+HIST = 120  # seconds of graph history
+
+
+# ------------------------------------------------------------- data helpers ----
+def nvsmi(fields, idx=GPU):
+    r = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={','.join(fields)}",
+         "--format=csv,noheader,nounits", "-i", str(idx)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return {}
+    vals = [v.strip() for v in r.stdout.strip().split(",")]
+    return dict(zip(fields, vals))
+
+
+def num(x, d=0.0):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return d
+
+
+def nvtune(*args):
+    """Run an nvtune subcommand; return (ok, output)."""
+    r = subprocess.run([NVTUNE, "-i", str(GPU), *map(str, args)],
+                       capture_output=True, text=True)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+# --------------------------------------------------------------- live graph ----
+class Graph(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.set_content_height(160)
+        self.set_hexpand(True)
+        self.temp = deque([0] * HIST, maxlen=HIST)
+        self.powr = deque([0] * HIST, maxlen=HIST)   # % of limit
+        self.util = deque([0] * HIST, maxlen=HIST)
+        self.set_draw_func(self._draw)
+
+    def push(self, temp, powr_pct, util):
+        self.temp.append(temp); self.powr.append(powr_pct); self.util.append(util)
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cr.set_source_rgb(0.10, 0.11, 0.13); cr.paint()
+        cr.set_source_rgb(0.22, 0.23, 0.26); cr.set_line_width(1)
+        for i in range(1, 4):                    # grid
+            y = h * i / 4
+            cr.move_to(0, y); cr.line_to(w, y); cr.stroke()
+
+        def line(data, rgb, scale):
+            cr.set_source_rgb(*rgb); cr.set_line_width(2)
+            n = len(data)
+            for i, v in enumerate(data):
+                x = w * i / (n - 1)
+                y = h - min(v / scale, 1.0) * h
+                cr.line_to(x, y) if i else cr.move_to(x, y)
+            cr.stroke()
+
+        line(self.util, (0.30, 0.80, 0.40), 100)   # util  green
+        line(self.powr, (0.95, 0.75, 0.25), 100)   # power yellow
+        line(self.temp, (0.90, 0.35, 0.35), 100)   # temp  red (0..100°C)
+
+
+# ----------------------------------------------------------------- main win ----
+class Win(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="nvtune — NVIDIA tuner")
+        self.set_default_size(560, 720)
+        self.coolbits = self._coolbits_available()
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+        self.set_child(root)
+
+        info = nvsmi(["name"])
+        title = Gtk.Label(xalign=0)
+        title.set_markup(f"<b>{info.get('name', 'NVIDIA GPU')}</b>")
+        title.add_css_class("title-2")
+        root.append(title)
+
+        # live readout cards
+        self.readout = {}
+        cards = Gtk.Box(spacing=8, homogeneous=True)
+        for key, lbl in [("temp", "Temp"), ("power", "Power"), ("util", "GPU"),
+                         ("core", "Core"), ("mem", "Mem"), ("vram", "VRAM"),
+                         ("fan", "Fan")]:
+            b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            b.add_css_class("card"); b.set_size_request(66, -1)
+            cap = Gtk.Label(label=lbl); cap.add_css_class("dim-label")
+            val = Gtk.Label(label="—")
+            val.set_attributes(self._mono()); val.add_css_class("heading")
+            b.append(cap); b.append(val)
+            self.readout[key] = val
+            cards.append(b)
+        root.append(cards)
+
+        root.append(self._make_graph())
+
+        legend = Gtk.Label(xalign=0)
+        legend.set_markup("<small><span foreground='#e05a5a'>■ temp</span>   "
+                          "<span foreground='#f2bf40'>■ power</span>   "
+                          "<span foreground='#4dcc66'>■ gpu%</span></small>")
+        root.append(legend)
+
+        root.append(Gtk.Separator())
+
+        # tuning sliders
+        gmin, gmax = self._power_range()
+        self.s_power = self._slider(root, "Power limit (W)", gmin, gmax,
+                                    num(nvsmi(["power.limit"]).get("power.limit"), gmax), 5)
+        cmin, cmax = self._clock_range()
+        self.lock_on = Gtk.CheckButton(label="Lock core clock")
+        root.append(self.lock_on)
+        self.s_clock = self._slider(root, "Locked core clock (MHz)", cmin, cmax,
+                                    (cmin + cmax) // 2, 15)
+        self.s_goff = self._slider(root, "Core clock offset (MHz)  [Coolbits]",
+                                   -200, 300, 0, 5)
+        self.s_moff = self._slider(root, "Memory offset (MHz)  [Coolbits]",
+                                   -500, 1500, 0, 25)
+        self.fan_on = Gtk.CheckButton(label="Manual fan  [Coolbits]")
+        root.append(self.fan_on)
+        self.s_fan = self._slider(root, "Fan speed (%)", 0, 100, 50, 5)
+        if not self.coolbits:
+            for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
+                w.set_sensitive(False)
+
+        # action buttons
+        acts = Gtk.Box(spacing=8, margin_top=6)
+        b_apply = Gtk.Button(label="Apply"); b_apply.add_css_class("suggested-action")
+        b_apply.connect("clicked", self.on_apply)
+        b_reset = Gtk.Button(label="Reset to stock"); b_reset.add_css_class("destructive-action")
+        b_reset.connect("clicked", self.on_reset)
+        acts.append(b_apply); acts.append(b_reset)
+        root.append(acts)
+
+        root.append(Gtk.Separator())
+
+        # profiles
+        prow = Gtk.Box(spacing=8)
+        self.prof_name = Gtk.Entry(placeholder_text="profile name")
+        self.prof_name.set_hexpand(True)
+        b_save = Gtk.Button(label="Save"); b_save.connect("clicked", self.on_save)
+        self.prof_dd = Gtk.DropDown.new_from_strings(self._profiles() or ["(none)"])
+        b_load = Gtk.Button(label="Apply"); b_load.connect("clicked", self.on_load)
+        prow.append(self.prof_name); prow.append(b_save)
+        prow.append(self.prof_dd); prow.append(b_load)
+        root.append(prow)
+
+        # osd + status
+        osd = Gtk.Box(spacing=8, margin_top=4)
+        b_osd = Gtk.Button(label="🎮 Enable in-game overlay (MangoHud)")
+        b_osd.connect("clicked", self.on_osd)
+        osd.append(b_osd)
+        root.append(osd)
+
+        self.status = Gtk.Label(xalign=0); self.status.add_css_class("dim-label")
+        root.append(self.status)
+
+        self._css()
+        self.refresh()
+        GLib.timeout_add(1000, self.refresh)
+
+    # ---- ui builders ----
+    def _make_graph(self):
+        self.graph = Graph()
+        f = Gtk.Frame(); f.set_child(self.graph)
+        return f
+
+    def _slider(self, parent, label, lo, hi, val, step):
+        parent.append(Gtk.Label(label=label, xalign=0))
+        adj = Gtk.Adjustment(lower=lo, upper=hi, value=val,
+                             step_increment=step, page_increment=step * 4)
+        s = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+        s.set_draw_value(True); s.set_digits(0); s.set_hexpand(True)
+        parent.append(s)
+        return s
+
+    def _mono(self):
+        a = Pango.AttrList()
+        a.insert(Pango.attr_family_new("monospace"))
+        return a
+
+    def _css(self):
+        try:
+            css = Gtk.CssProvider()
+            data = ".card{padding:6px;border-radius:8px;" \
+                   "background:alpha(@window_fg_color,0.06);}"
+            try:
+                css.load_from_data(data.encode())          # older PyGObject
+            except TypeError:
+                css.load_from_data(data, -1)                # newer signature
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        except Exception:
+            pass
+
+    # ---- capability probes ----
+    def _power_range(self):
+        d = nvsmi(["power.min_limit", "power.max_limit"])
+        return int(num(d.get("power.min_limit"), 100)), int(num(d.get("power.max_limit"), 300))
+
+    def _clock_range(self):
+        d = nvsmi(["clocks.max.gr"])
+        cmax = int(num(d.get("clocks.max.gr"), 2100))
+        return 300, cmax
+
+    def _coolbits_available(self):
+        r = subprocess.run(["nvidia-settings", "-q", f"[gpu:{GPU}]/GPUGraphicsClockOffsetAllPerformanceLevels"],
+                           capture_output=True, text=True,
+                           env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")})
+        return r.returncode == 0 and "ERROR" not in r.stdout
+
+    def _profiles(self):
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        return sorted(p.stem for p in PROFILE_DIR.glob("*.json"))
+
+    # ---- live refresh ----
+    def refresh(self, *_):
+        d = nvsmi(["temperature.gpu", "power.draw", "power.limit",
+                   "utilization.gpu", "clocks.gr", "clocks.mem",
+                   "memory.used", "memory.total", "fan.speed"])
+        if not d:
+            self.status.set_text("nvidia-smi not responding")
+            return True
+        t = num(d["temperature.gpu"]); p = num(d["power.draw"]); pl = num(d["power.limit"], 1)
+        u = num(d["utilization.gpu"])
+        self.readout["temp"].set_text(f"{t:.0f}°C")
+        self.readout["power"].set_text(f"{p:.0f}W")
+        self.readout["util"].set_text(f"{u:.0f}%")
+        self.readout["core"].set_text(f"{num(d['clocks.gr']):.0f}")
+        self.readout["mem"].set_text(f"{num(d['clocks.mem']):.0f}")
+        self.readout["vram"].set_text(f"{num(d['memory.used'])/1024:.1f}G")
+        fan = d["fan.speed"]
+        self.readout["fan"].set_text(f"{fan}%" if fan not in ("N/A", "[N/A]") else "—")
+        self.graph.push(t, min(p / pl * 100, 100), u)
+        return True
+
+    # ---- actions ----
+    def _set_status(self, msg, ok=True):
+        self.status.set_markup(
+            f"<span foreground='{'#4dcc66' if ok else '#e05a5a'}'>{GLib.markup_escape_text(msg)}</span>")
+
+    def on_apply(self, _):
+        args = ["set", "--power", int(self.s_power.get_value())]
+        if self.lock_on.get_active():
+            c = int(self.s_clock.get_value()); args += ["--lock-clock", f"{c},{c}"]
+        if self.coolbits:
+            if self.s_goff.get_value(): args += ["--gpu-offset", int(self.s_goff.get_value())]
+            if self.s_moff.get_value(): args += ["--mem-offset", int(self.s_moff.get_value())]
+            if self.fan_on.get_active(): args += ["--fan", int(self.s_fan.get_value())]
+        ok, out = nvtune(*args)
+        self._set_status("Applied ✓" if ok else f"Apply failed: {out.splitlines()[-1] if out else ''}", ok)
+
+    def on_reset(self, _):
+        ok, out = nvtune("reset")
+        self.lock_on.set_active(False)
+        self._set_status("Reset to stock ✓" if ok else "Reset failed", ok)
+
+    def on_save(self, _):
+        name = self.prof_name.get_text().strip()
+        if not name:
+            self._set_status("Enter a profile name first", False); return
+        args = ["profile", "save", name, "--power", int(self.s_power.get_value())]
+        if self.lock_on.get_active():
+            c = int(self.s_clock.get_value()); args += ["--lock-clock", f"{c},{c}"]
+        if self.coolbits and self.s_goff.get_value():
+            args += ["--gpu-offset", int(self.s_goff.get_value())]
+        ok, out = nvtune(*args)
+        if ok:
+            self.prof_dd.set_model(Gtk.StringList.new(self._profiles()))
+        self._set_status(f"Saved profile '{name}' ✓" if ok else "Save failed", ok)
+
+    def on_load(self, _):
+        sel = self.prof_dd.get_selected_item()
+        if not sel or sel.get_string() == "(none)":
+            self._set_status("No profile selected", False); return
+        name = sel.get_string()
+        ok, out = nvtune("profile", "apply", name)
+        self._set_status(f"Applied profile '{name}' ✓" if ok else "Apply failed", ok)
+
+    def on_osd(self, btn):
+        btn.set_sensitive(False)
+        self._set_status("Installing/enabling MangoHud overlay…")
+        def done(ok, out):
+            btn.set_sensitive(True)
+            self._set_status("Overlay ready — launch games with 'mangohud <game>' "
+                             "(Steam: mangohud %command%)" if ok else "OSD setup failed", ok)
+            return False
+        ok, out = nvtune("osd", "install")
+        GLib.idle_add(done, ok, out)
+
+
+def main():
+    app = Gtk.Application(application_id="com.windystrife.nvtune")
+    app.connect("activate", lambda a: Win(a).present())
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

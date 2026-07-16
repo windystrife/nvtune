@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=nvtune
+GenericName=NVIDIA GPU tuner
+Comment=Undervolt, monitor and overlay for NVIDIA GPUs
+Comment[vi]=Undervolt, xem thông số và OSD cho GPU NVIDIA
+Exec=nvtune-gui
+Icon=nvidia-settings
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=nvidia;gpu;undervolt;overclock;monitor;afterburner;

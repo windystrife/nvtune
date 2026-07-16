@@ -4,6 +4,8 @@ A small **MSI-Afterburner-style** tool for **NVIDIA GPUs on Linux** — undervol
 
 > 🇻🇳 **Tiếng Việt bên dưới** — [nhảy tới](#-tiếng-việt)
 
+![nvtune GUI](docs/screenshot.png)
+
 ```
 $ nvtune monitor
               nvtune — NVIDIA live monitor
@@ -11,8 +13,11 @@ $ nvtune monitor
  0 GeForce 2080 43°C   62/250W   12%   1350/2100  0.4/22G  35%
 ```
 
+Comes in two flavours: a **graphical tuner** (`nvtune-gui`, GTK4 — sliders, live graph, Apply/Reset) and a **CLI/TUI** (`nvtune`) for terminals and scripting.
+
 ## Features
 
+* **GUI** (`nvtune-gui`) — Afterburner-style window: live readouts + rolling graph, sliders for power/clock/offsets/fan, Apply/Reset, profiles, overlay toggle
 * **monitor** — live TUI dashboard (temp, power, clocks, util, VRAM, fan)
 * **undervolt / set** — power limit, GPU-clock lock, clock & memory offsets, fan
 * **reset** — revert everything to stock
@@ -35,6 +40,8 @@ Requirements: an NVIDIA GPU with the proprietary driver (`nvidia-smi`), Python 3
 ## Usage
 
 ```sh
+nvtune-gui                                      # graphical tuner (or launch "nvtune" from the app menu)
+
 nvtune monitor                                  # live dashboard (Ctrl-C to quit)
 
 # Undervolt: lock the core clock and cap power (the Linux undervolt)
@@ -72,8 +79,11 @@ Multiple GPUs: add `-i <index>` (e.g. `nvtune -i 1 monitor`).
 
 Tool nhỏ kiểu **MSI Afterburner** cho **GPU NVIDIA trên Linux** — undervolt, xem thông số live, lưu profile, và OSD hiện thông số trong game.
 
+Có 2 dạng: **GUI đồ hoạ** (`nvtune-gui`, GTK4 — slider, đồ thị live, Apply/Reset) và **CLI/TUI** (`nvtune`) cho terminal/script.
+
 ## Tính năng
 
+* **GUI** (`nvtune-gui`) — cửa sổ kiểu Afterburner: readout live + đồ thị, slider power/clock/offset/quạt, Apply/Reset, profile, bật OSD
 * **monitor** — bảng TUI live (nhiệt độ, điện, clock, tải, VRAM, quạt)
 * **undervolt / set** — power limit, khoá clock GPU, offset clock & mem, quạt
 * **reset** — về stock
