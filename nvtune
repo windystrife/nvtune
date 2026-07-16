@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+nvtune - a small MSI-Afterburner-style tool for NVIDIA GPUs on Linux.
+
+Features
+  * monitor : live TUI dashboard (temp, power, clocks, util, VRAM, fan)
+  * set     : apply power limit / lock GPU clock / clock+mem offsets
+  * reset   : revert everything to stock
+  * profile : save / apply / list / remove named tuning profiles
+  * autostart : apply a profile at every boot (systemd)
+  * osd     : in-game overlay via MangoHud (install / configure / run a game)
+
+Undervolt note (Linux/NVIDIA): the driver exposes no voltage curve. The
+effective "undervolt" is to LOCK the GPU clock (nvidia-smi -lgc) and cap the
+power limit (-pl); the GPU then runs that clock at the lowest voltage it needs.
+An optional positive clock offset (needs Xorg "Coolbits") lets the same voltage
+reach a higher clock. This tool wraps all of that.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
+SYSTEMD_UNIT = Path("/etc/systemd/system/nvtune-profile.service")
+
+# ---------------------------------------------------------------- helpers ----
+
+def _run(cmd, check=False, capture=True):
+    return subprocess.run(cmd, text=True, check=check,
+                          capture_output=capture)
+
+def _as_root(cmd):
+    """Prefix with sudo when we are not already root."""
+    if os.geteuid() != 0:
+        return ["sudo"] + cmd
+    return cmd
+
+def have(binname):
+    return shutil.which(binname) is not None
+
+def die(msg, code=1):
+    print(f"nvtune: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def require_nvsmi():
+    if not have("nvidia-smi"):
+        die("nvidia-smi not found (install the NVIDIA driver).")
+
+# ------------------------------------------------------------- gpu queries ----
+
+QFIELDS = [
+    "index", "name", "temperature.gpu", "power.draw", "power.limit",
+    "power.default_limit", "power.min_limit", "power.max_limit",
+    "utilization.gpu", "utilization.memory",
+    "clocks.gr", "clocks.max.gr", "clocks.mem", "clocks.max.mem",
+    "memory.used", "memory.total", "fan.speed", "pstate",
+]
+
+def query(index=0):
+    res = _run(["nvidia-smi",
+                f"--query-gpu={','.join(QFIELDS)}",
+                "--format=csv,noheader,nounits", "-i", str(index)])
+    if res.returncode != 0:
+        die(res.stderr.strip() or "nvidia-smi query failed")
+    vals = [v.strip() for v in res.stdout.strip().split(",")]
+    d = dict(zip(QFIELDS, vals))
+    return d
+
+def list_gpus():
+    res = _run(["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"])
+    out = []
+    for line in res.stdout.strip().splitlines():
+        idx, name = line.split(", ", 1)
+        out.append((int(idx), name))
+    return out
+
+def _num(x, default=0.0):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+# ---------------------------------------------------------------- monitor ----
+
+def cmd_monitor(args):
+    require_nvsmi()
+    try:
+        from rich.live import Live
+        from rich.table import Table
+        from rich import box
+    except ImportError:
+        return _monitor_plain(args)
+
+    def render():
+        t = Table(box=box.SIMPLE_HEAVY, title="nvtune — NVIDIA live monitor",
+                  title_style="bold cyan", expand=True)
+        for col in ("GPU", "Temp", "Power", "GPU%", "Mem%",
+                    "Core clk", "Mem clk", "VRAM", "Fan", "Pstate"):
+            t.add_column(col, justify="right")
+        for idx, _ in list_gpus():
+            d = query(idx)
+            temp = _num(d["temperature.gpu"])
+            tcol = "green" if temp < 65 else "yellow" if temp < 80 else "red"
+            t.add_row(
+                f"{d['index']} {d['name'].replace('NVIDIA ', '')[:18]}",
+                f"[{tcol}]{temp:.0f}°C[/]",
+                f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W",
+                f"{_num(d['utilization.gpu']):.0f}%",
+                f"{_num(d['utilization.memory']):.0f}%",
+                f"{_num(d['clocks.gr']):.0f}/{_num(d['clocks.max.gr']):.0f}",
+                f"{_num(d['clocks.mem']):.0f}/{_num(d['clocks.max.mem']):.0f}",
+                f"{_num(d['memory.used'])/1024:.1f}/{_num(d['memory.total'])/1024:.1f}G",
+                f"{d['fan.speed']}%" if d['fan.speed'] not in ("N/A", "[N/A]") else "—",
+                d["pstate"],
+            )
+        return t
+
+    with Live(render(), refresh_per_second=1, screen=False) as live:
+        try:
+            while True:
+                time.sleep(args.interval)
+                live.update(render())
+        except KeyboardInterrupt:
+            pass
+
+def _monitor_plain(args):
+    try:
+        while True:
+            d = query(args.gpu)
+            print(f"\r{d['name'].replace('NVIDIA ','')}: "
+                  f"{_num(d['temperature.gpu']):.0f}°C  "
+                  f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W  "
+                  f"gpu {_num(d['utilization.gpu']):.0f}%  "
+                  f"core {_num(d['clocks.gr']):.0f}MHz  "
+                  f"mem {_num(d['memory.used'])/1024:.1f}/"
+                  f"{_num(d['memory.total'])/1024:.1f}G  fan {d['fan.speed']}   ",
+                  end="", flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+
+# ------------------------------------------------------------------- apply ----
+
+def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
+                   mem_offset=None, fan=None, verbose=True):
+    """Apply tuning to one GPU. Returns list of (label, ok, detail)."""
+    require_nvsmi()
+    results = []
+
+    # persistence mode keeps clock locks sticky
+    _run(_as_root(["nvidia-smi", "-i", str(gpu), "-pm", "1"]))
+
+    if power is not None:
+        r = _run(_as_root(["nvidia-smi", "-i", str(gpu), "-pl", str(power)]))
+        results.append(("power limit %sW" % power, r.returncode == 0,
+                        (r.stdout + r.stderr).strip()))
+
+    if lock_clock is not None:
+        r = _run(_as_root(["nvidia-smi", "-i", str(gpu), "-lgc", lock_clock]))
+        results.append(("lock core clock %s" % lock_clock, r.returncode == 0,
+                        (r.stdout + r.stderr).strip()))
+
+    # clock offsets go through nvidia-settings and need Xorg + Coolbits
+    if gpu_offset is not None or mem_offset is not None:
+        env = dict(os.environ)
+        env.setdefault("DISPLAY", ":0")
+        args_ns = ["nvidia-settings"]
+        if gpu_offset is not None:
+            args_ns += ["-a", f"[gpu:{gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels={gpu_offset}"]
+        if mem_offset is not None:
+            args_ns += ["-a", f"[gpu:{gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels={mem_offset}"]
+        r = subprocess.run(_as_root(args_ns), text=True, capture_output=True, env=env)
+        ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
+        results.append(("clock offset (gpu=%s mem=%s)" % (gpu_offset, mem_offset), ok,
+                        (r.stdout + r.stderr).strip() or "needs Xorg + Coolbits"))
+
+    if fan is not None:
+        env = dict(os.environ); env.setdefault("DISPLAY", ":0")
+        ns = ["nvidia-settings",
+              "-a", f"[gpu:{gpu}]/GPUFanControlState=1",
+              "-a", f"[fan:{gpu}]/GPUTargetFanSpeed={fan}"]
+        r = subprocess.run(_as_root(ns), text=True, capture_output=True, env=env)
+        results.append(("fan %s%%" % fan, r.returncode == 0,
+                        (r.stdout + r.stderr).strip() or "needs Xorg + Coolbits"))
+
+    if verbose:
+        for label, ok, detail in results:
+            mark = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+            print(f"  {mark} {label}" + (f"   ({detail.splitlines()[-1]})" if not ok and detail else ""))
+    return results
+
+def cmd_set(args):
+    apply_settings(args.gpu, power=args.power, lock_clock=args.lock_clock,
+                   gpu_offset=args.gpu_offset, mem_offset=args.mem_offset,
+                   fan=args.fan)
+
+def cmd_undervolt(args):
+    """Convenience: lock the core clock + cap power (the Linux undervolt)."""
+    lock = f"{args.clock},{args.clock}" if args.clock else None
+    print(f"Undervolt GPU {args.gpu}: "
+          f"lock core {args.clock}MHz, power {args.power}W"
+          + (f", +{args.gpu_offset}MHz offset" if args.gpu_offset else ""))
+    apply_settings(args.gpu, power=args.power, lock_clock=lock,
+                   gpu_offset=args.gpu_offset)
+
+def cmd_reset(args):
+    require_nvsmi()
+    for label, cmd in [
+        ("unlock core clock", ["nvidia-smi", "-i", str(args.gpu), "-rgc"]),
+        ("unlock mem clock",  ["nvidia-smi", "-i", str(args.gpu), "-rmc"]),
+        ("default power limit", ["nvidia-smi", "-i", str(args.gpu), "-pl",
+                                 query(args.gpu)["power.default_limit"].split(".")[0]]),
+    ]:
+        r = _run(_as_root(cmd))
+        mark = "\033[32m✓\033[0m" if r.returncode == 0 else "\033[31m✗\033[0m"
+        print(f"  {mark} {label}")
+    # zero the offsets (best effort, needs X)
+    env = dict(os.environ); env.setdefault("DISPLAY", ":0")
+    subprocess.run(_as_root(["nvidia-settings",
+        "-a", f"[gpu:{args.gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels=0",
+        "-a", f"[gpu:{args.gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels=0",
+        "-a", f"[gpu:{args.gpu}]/GPUFanControlState=0"]),
+        text=True, capture_output=True, env=env)
+    print("  reset done")
+
+# ---------------------------------------------------------------- profiles ----
+
+def cmd_profile(args):
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    if args.action == "list":
+        profs = sorted(PROFILE_DIR.glob("*.json"))
+        if not profs:
+            print("no profiles yet — save one with:  nvtune profile save <name> --power ...")
+        for p in profs:
+            data = json.loads(p.read_text())
+            print(f"  {p.stem:16} {json.dumps(data)}")
+    elif args.action == "save":
+        data = {k: v for k, v in dict(
+            gpu=args.gpu, power=args.power, lock_clock=args.lock_clock,
+            gpu_offset=args.gpu_offset, mem_offset=args.mem_offset, fan=args.fan
+        ).items() if v is not None}
+        (PROFILE_DIR / f"{args.name}.json").write_text(json.dumps(data, indent=2))
+        print(f"saved profile '{args.name}': {data}")
+    elif args.action == "apply":
+        p = PROFILE_DIR / f"{args.name}.json"
+        if not p.exists():
+            die(f"profile '{args.name}' not found")
+        data = json.loads(p.read_text())
+        print(f"applying profile '{args.name}': {data}")
+        apply_settings(**data)
+    elif args.action in ("rm", "remove"):
+        (PROFILE_DIR / f"{args.name}.json").unlink(missing_ok=True)
+        print(f"removed profile '{args.name}'")
+
+def cmd_autostart(args):
+    p = PROFILE_DIR / f"{args.name}.json"
+    if not p.exists():
+        die(f"profile '{args.name}' not found — save it first")
+    self_path = os.path.abspath(sys.argv[0])
+    unit = f"""[Unit]
+Description=Apply nvtune GPU profile '{args.name}' at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart={self_path} profile apply {args.name}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+    subprocess.run(_as_root(["tee", str(SYSTEMD_UNIT)]),
+                   input=unit, text=True, capture_output=True)
+    _run(_as_root(["systemctl", "daemon-reload"]))
+    _run(_as_root(["systemctl", "enable", "nvtune-profile.service"]))
+    print(f"profile '{args.name}' will now be applied at every boot.")
+    print("  disable with:  sudo systemctl disable --now nvtune-profile.service")
+
+# --------------------------------------------------------------------- osd ----
+
+MANGOHUD_CONF = """\
+# nvtune MangoHud config — in-game overlay
+fps
+frametime
+gpu_stats
+gpu_temp
+gpu_core_clock
+gpu_mem_clock
+gpu_power
+vram
+cpu_stats
+cpu_temp
+ram
+gpu_name
+engine_version
+vulkan_driver
+position=top-left
+font_size=20
+background_alpha=0.4
+toggle_hud=Shift_R+F12
+"""
+
+def cmd_osd(args):
+    if args.action == "install":
+        if have("mangohud"):
+            print("MangoHud already installed.")
+        else:
+            print("Installing MangoHud (apt)…")
+            r = subprocess.run(_as_root(["apt-get", "install", "-y", "mangohud"]),
+                               text=True)
+            if r.returncode != 0:
+                die("apt install mangohud failed")
+        cmd_osd_config(args)
+    elif args.action == "config":
+        cmd_osd_config(args)
+    elif args.action == "run":
+        if not have("mangohud"):
+            die("MangoHud not installed — run:  nvtune osd install")
+        if not args.command:
+            die("give a command:  nvtune osd run -- <game/launcher>")
+        os.execvp("mangohud", ["mangohud"] + args.command)
+
+def cmd_osd_config(args):
+    conf = Path.home() / ".config" / "MangoHud" / "MangoHud.conf"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text(MANGOHUD_CONF)
+    print(f"wrote MangoHud overlay config -> {conf}")
+    print("Use it by launching a game as:  mangohud <game>   (or: nvtune osd run -- <game>)")
+    print("For Steam, set launch options to:  mangohud %command%")
+
+# -------------------------------------------------------------------- main ----
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="nvtune",
+        description="MSI-Afterburner-style undervolt / monitor / OSD for NVIDIA on Linux")
+    p.add_argument("-i", "--gpu", type=int, default=0, help="GPU index (default 0)")
+    sub = p.add_subparsers(dest="cmd")
+
+    m = sub.add_parser("monitor", help="live TUI dashboard")
+    m.add_argument("--interval", type=float, default=1.0)
+    m.set_defaults(func=cmd_monitor)
+
+    s = sub.add_parser("set", help="apply individual tuning values")
+    s.add_argument("--power", type=int, help="power limit in watts")
+    s.add_argument("--lock-clock", help="lock core clock 'MIN,MAX' or 'FREQ'")
+    s.add_argument("--gpu-offset", type=int, help="core clock offset MHz (needs Coolbits)")
+    s.add_argument("--mem-offset", type=int, help="mem transfer-rate offset MHz (needs Coolbits)")
+    s.add_argument("--fan", type=int, help="fan speed %% (needs Coolbits)")
+    s.set_defaults(func=cmd_set)
+
+    u = sub.add_parser("undervolt", help="lock core clock + cap power (Linux undervolt)")
+    u.add_argument("--clock", type=int, required=True, help="locked core clock MHz")
+    u.add_argument("--power", type=int, required=True, help="power limit W")
+    u.add_argument("--gpu-offset", type=int, help="optional +offset MHz (needs Coolbits)")
+    u.set_defaults(func=cmd_undervolt)
+
+    r = sub.add_parser("reset", help="revert to stock clocks / power / offsets")
+    r.set_defaults(func=cmd_reset)
+
+    pr = sub.add_parser("profile", help="save/apply/list/remove tuning profiles")
+    pr.add_argument("action", choices=["save", "apply", "list", "rm", "remove"])
+    pr.add_argument("name", nargs="?")
+    pr.add_argument("--power", type=int)
+    pr.add_argument("--lock-clock")
+    pr.add_argument("--gpu-offset", type=int)
+    pr.add_argument("--mem-offset", type=int)
+    pr.add_argument("--fan", type=int)
+    pr.set_defaults(func=cmd_profile)
+
+    a = sub.add_parser("autostart", help="apply a profile at every boot (systemd)")
+    a.add_argument("name")
+    a.set_defaults(func=cmd_autostart)
+
+    o = sub.add_parser("osd", help="in-game overlay via MangoHud")
+    o.add_argument("action", choices=["install", "config", "run"])
+    o.add_argument("command", nargs=argparse.REMAINDER,
+                   help="for 'run': -- <game/launcher>")
+    o.set_defaults(func=cmd_osd)
+
+    return p
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        args.cmd, args.interval, args.func = "monitor", 1.0, cmd_monitor
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
