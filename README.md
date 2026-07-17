@@ -68,7 +68,7 @@ Multiple GPUs: add `-i <index>` (e.g. `nvtune -i 1 monitor`).
 
 ## Notes
 
-* **Clock offsets & fan control** need Xorg's `Coolbits` enabled (add `Option "Coolbits" "28"` to the NVIDIA Device section and restart the display manager). Power limit + clock lock work without it.
+* **Clock offsets & fan control** need Xorg's `Coolbits` enabled (add `Option "Coolbits" "28"` to the NVIDIA Device section and restart the display manager) **and** the GPU to be driving a **real display head** — a monitor or a cheap HDMI/DP dummy plug. On a headless box or a virtual/CustomEDID display the driver rejects them with `Unknown Error`. Power limit + clock lock work regardless.
 * Locking clocks / power limits needs root — `nvtune` calls `sudo` automatically.
 * Always test tuning under load and revert with `nvtune reset` if unstable.
 
@@ -131,6 +131,6 @@ Nhiều GPU: thêm `-i <index>`.
 
 ## Lưu ý
 
-* **Clock offset & quạt** cần bật `Coolbits` trong Xorg (`Option "Coolbits" "28"` vào Device section NVIDIA + restart display manager). Power limit + lock clock thì không cần.
+* **Clock offset & quạt** cần bật `Coolbits` trong Xorg (`Option "Coolbits" "28"` vào Device section NVIDIA + restart display manager) **và** GPU phải đang xuất **một màn hình thật** — màn hình hoặc cục HDMI/DP dummy plug giá rẻ. Máy headless hoặc màn ảo/CustomEDID thì driver báo `Unknown Error`. Power limit + lock clock thì luôn chạy.
 * Khoá clock/power cần root — `nvtune` tự gọi `sudo`.
 * Luôn test khi có tải, không ổn thì `nvtune reset`.

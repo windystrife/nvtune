@@ -146,6 +146,28 @@ def _monitor_plain(args):
 
 # ------------------------------------------------------------------- apply ----
 
+def _mark(ok):
+    """✓/✗ marker, coloured only when writing to a real terminal (so the GUI,
+    which captures our stdout, doesn't get raw ANSI escape codes)."""
+    if sys.stdout.isatty():
+        return "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+    return "✓" if ok else "✗"
+
+
+def _ns_fail_hint(out):
+    """Turn a failed nvidia-settings assignment into an actionable message.
+    nvidia-settings returns exit 0 even when an assignment fails, so callers
+    must scan the text for 'ERROR' — and the usual headless failure is the
+    opaque '(Unknown Error)' on fan / clock-offset, which really means the
+    GPU has no real display head driving pixels."""
+    out = (out or "").strip()
+    if "Unknown Error" in out:
+        return ("needs a real display head — attach a monitor or a cheap "
+                "HDMI/DP dummy plug; a virtual/CustomEDID display is not "
+                "enough for fan/offset control")
+    return out or "needs Xorg + Coolbits"
+
+
 def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
                    mem_offset=None, fan=None, verbose=True):
     """Apply tuning to one GPU. Returns list of (label, ok, detail)."""
@@ -177,7 +199,7 @@ def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
         r = subprocess.run(_as_root(args_ns), text=True, capture_output=True, env=env)
         ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
         results.append(("clock offset (gpu=%s mem=%s)" % (gpu_offset, mem_offset), ok,
-                        (r.stdout + r.stderr).strip() or "needs Xorg + Coolbits"))
+                        (r.stdout + r.stderr).strip() if ok else _ns_fail_hint(r.stdout + r.stderr)))
 
     if fan is not None:
         env = dict(os.environ); env.setdefault("DISPLAY", ":0")
@@ -185,19 +207,24 @@ def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
               "-a", f"[gpu:{gpu}]/GPUFanControlState=1",
               "-a", f"[fan:{gpu}]/GPUTargetFanSpeed={fan}"]
         r = subprocess.run(_as_root(ns), text=True, capture_output=True, env=env)
-        results.append(("fan %s%%" % fan, r.returncode == 0,
-                        (r.stdout + r.stderr).strip() or "needs Xorg + Coolbits"))
+        ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
+        results.append(("fan %s%%" % fan, ok,
+                        (r.stdout + r.stderr).strip() if ok else _ns_fail_hint(r.stdout + r.stderr)))
 
     if verbose:
         for label, ok, detail in results:
-            mark = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
-            print(f"  {mark} {label}" + (f"   ({detail.splitlines()[-1]})" if not ok and detail else ""))
+            print(f"  {_mark(ok)} {label}"
+                  + (f"   ({detail.splitlines()[-1]})" if not ok and detail else ""))
     return results
 
+def _results_rc(results):
+    """Exit code from apply results: 0 if every setting stuck, else 1."""
+    return 0 if all(ok for _, ok, _ in results) else 1
+
 def cmd_set(args):
-    apply_settings(args.gpu, power=args.power, lock_clock=args.lock_clock,
-                   gpu_offset=args.gpu_offset, mem_offset=args.mem_offset,
-                   fan=args.fan)
+    return _results_rc(apply_settings(
+        args.gpu, power=args.power, lock_clock=args.lock_clock,
+        gpu_offset=args.gpu_offset, mem_offset=args.mem_offset, fan=args.fan))
 
 def cmd_undervolt(args):
     """Convenience: lock the core clock + cap power (the Linux undervolt)."""
@@ -205,8 +232,8 @@ def cmd_undervolt(args):
     print(f"Undervolt GPU {args.gpu}: "
           f"lock core {args.clock}MHz, power {args.power}W"
           + (f", +{args.gpu_offset}MHz offset" if args.gpu_offset else ""))
-    apply_settings(args.gpu, power=args.power, lock_clock=lock,
-                   gpu_offset=args.gpu_offset)
+    return _results_rc(apply_settings(args.gpu, power=args.power, lock_clock=lock,
+                                      gpu_offset=args.gpu_offset))
 
 def cmd_reset(args):
     require_nvsmi()
@@ -217,8 +244,7 @@ def cmd_reset(args):
                                  query(args.gpu)["power.default_limit"].split(".")[0]]),
     ]:
         r = _run(_as_root(cmd))
-        mark = "\033[32m✓\033[0m" if r.returncode == 0 else "\033[31m✗\033[0m"
-        print(f"  {mark} {label}")
+        print(f"  {_mark(r.returncode == 0)} {label}")
     # zero the offsets (best effort, needs X)
     env = dict(os.environ); env.setdefault("DISPLAY", ":0")
     subprocess.run(_as_root(["nvidia-settings",
@@ -252,7 +278,7 @@ def cmd_profile(args):
             die(f"profile '{args.name}' not found")
         data = json.loads(p.read_text())
         print(f"applying profile '{args.name}': {data}")
-        apply_settings(**data)
+        return _results_rc(apply_settings(**data))
     elif args.action in ("rm", "remove"):
         (PROFILE_DIR / f"{args.name}.json").unlink(missing_ok=True)
         print(f"removed profile '{args.name}'")
@@ -389,7 +415,7 @@ def main():
     args = parser.parse_args()
     if not getattr(args, "func", None):
         args.cmd, args.interval, args.func = "monitor", 1.0, cmd_monitor
-    args.func(args)
+    sys.exit(args.func(args) or 0)
 
 if __name__ == "__main__":
     main()

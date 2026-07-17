@@ -230,6 +230,11 @@ class Win(Gtk.ApplicationWindow):
         self.fan_on = Gtk.CheckButton(label="Manual fan  [Coolbits]")
         root.append(self.fan_on)
         self.s_fan = self._slider(root, "Fan speed (%)", 0, 100, 50, 5)
+        hw_tip = ("Needs Coolbits AND a real display head (a monitor or a cheap "
+                  "HDMI/DP dummy plug). On a headless / virtual display the driver "
+                  "rejects fan & clock-offset with 'Unknown Error'.")
+        for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
+            w.set_tooltip_text(hw_tip)
         if not self.coolbits:
             for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
                 w.set_sensitive(False)
