@@ -49,6 +49,90 @@ def nvtune(*args):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+# ------------------------------------------------------------- NVAPI temps ----
+# Hotspot + VRAM temperature are not exposed by nvidia-smi/NVML on GeForce; read
+# them from NVAPI (libnvidia-api.so.1, driver >=555): thermal index 9 = hotspot,
+# 15 = VRAM, fixed-point /256. Read-only, no root. Disabled if unavailable.
+class _NvAPI:
+    Q_INIT, Q_ENUM, Q_BUSID, Q_THERM = 0x0150e828, 0xe5ac921f, 0x1be0b8e5, 0x65fe3aad
+
+    def __init__(self):
+        self.ok = False
+        try:
+            import ctypes as C
+            lib = C.CDLL("libnvidia-api.so.1")
+            lib.nvapi_QueryInterface.restype = C.c_void_p
+            lib.nvapi_QueryInterface.argtypes = [C.c_uint]
+
+            def qi(i):
+                p = lib.nvapi_QueryInterface(i)
+                if not p:
+                    raise OSError("nvapi symbol missing")
+                return p
+
+            class TH(C.Structure):
+                _pack_ = 1
+                _fields_ = [("version", C.c_uint), ("mask", C.c_int),
+                            ("values", C.c_int * 40)]
+            self.C, self.TH = C, TH
+            self._init = C.CFUNCTYPE(C.c_int)(qi(self.Q_INIT))
+            self._enum = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_ENUM))
+            self._busid = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_BUSID))
+            self._therm = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(TH))(qi(self.Q_THERM))
+            if self._init() != 0:
+                raise OSError("init failed")
+            self.handles = (C.c_void_p * 64)()
+            self.count = C.c_uint(0)
+            if self._enum(self.handles, C.byref(self.count)) != 0 or self.count.value == 0:
+                raise OSError("enum failed")
+            self.ver = C.sizeof(TH) | (2 << 16)
+            mt = TH(version=self.ver, mask=1)
+            self.mask = 0x3fff
+            for bit in range(32):
+                mt.mask = 1 << bit
+                if self._therm(self.handles[0], C.byref(mt)) != 0:
+                    self.mask = mt.mask - 1
+                    break
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def temps(self, bus=None):
+        if not self.ok:
+            return None
+        C = self.C
+        h = self.handles[0]
+        if bus is not None:
+            for i in range(self.count.value):
+                b = C.c_uint(0)
+                if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
+                    h = self.handles[i]
+                    break
+        s = self.TH(version=self.ver, mask=self.mask)
+        if self._therm(h, C.byref(s)) != 0:
+            return None
+        hot, vr = s.values[9] // 256, s.values[15] // 256
+        return {"hotspot": hot if 0 < hot < 255 else None,
+                "vram": vr if 0 < vr < 255 else None}
+
+
+_nvapi = None
+
+
+def nvapi_temps(bus=None):
+    global _nvapi
+    if _nvapi is None:
+        _nvapi = _NvAPI()
+    return _nvapi.temps(bus)
+
+
+def _bus_of(bus_id):
+    try:
+        return int(bus_id.split(":")[-3], 16)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
 # --------------------------------------------------------------- live graph ----
 class Graph(Gtk.DrawingArea):
     def __init__(self):
@@ -179,7 +263,8 @@ class Win(Gtk.ApplicationWindow):
         # live readout cards
         self.readout = {}
         cards = Gtk.Box(spacing=8, homogeneous=True)
-        for key, lbl in [("temp", "Temp"), ("power", "Power"), ("util", "GPU"),
+        for key, lbl in [("temp", "Temp"), ("hot", "Hot"), ("vtemp", "Tmem"),
+                         ("power", "Power"), ("util", "GPU"),
                          ("core", "Core"), ("mem", "Mem"), ("vram", "VRAM"),
                          ("fan", "Fan")]:
             b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -352,13 +437,17 @@ class Win(Gtk.ApplicationWindow):
     def refresh(self, *_):
         d = nvsmi(["temperature.gpu", "power.draw", "power.limit",
                    "utilization.gpu", "clocks.gr", "clocks.mem",
-                   "memory.used", "memory.total", "fan.speed"])
+                   "memory.used", "memory.total", "fan.speed", "pci.bus_id"])
         if not d:
             self.status.set_text("nvidia-smi not responding")
             return True
         t = num(d["temperature.gpu"]); p = num(d["power.draw"]); pl = num(d["power.limit"], 1)
         u = num(d["utilization.gpu"])
         self.readout["temp"].set_text(f"{t:.0f}°C")
+        nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
+        hs, vt = nv.get("hotspot"), nv.get("vram")
+        self.readout["hot"].set_text(f"{hs:.0f}°C" if hs is not None else "—")
+        self.readout["vtemp"].set_text(f"{vt:.0f}°C" if vt is not None else "—")
         self.readout["power"].set_text(f"{p:.0f}W")
         self.readout["util"].set_text(f"{u:.0f}%")
         self.readout["core"].set_text(f"{num(d['clocks.gr']):.0f}")
