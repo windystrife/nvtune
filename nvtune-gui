@@ -21,6 +21,10 @@ NVTUNE = shutil.which("nvtune") or str(Path.home() / "nvtune" / "nvtune")
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
 GPU = 0
 HIST = 120  # seconds of graph history
+# GDDR6: nvidia-smi reports 4x the real (GPU-Z-style) memory clock. Show the real
+# clock and treat the memory offset in the same real-clock units (the CLI scales
+# it back up for nvidia-settings). See nvtune CLI for the hardware-verify caveat.
+MEM_CLOCK_RATIO = 4
 
 
 # ------------------------------------------------------------- data helpers ----
@@ -310,8 +314,8 @@ class Win(Gtk.ApplicationWindow):
                                     (cmin + cmax) // 2, 15)
         self.s_goff = self._slider(root, "Core clock offset (MHz)  [Coolbits]",
                                    -200, 300, 0, 5)
-        self.s_moff = self._slider(root, "Memory offset (MHz)  [Coolbits]",
-                                   -500, 1500, 0, 25)
+        self.s_moff = self._slider(root, "Memory offset (MHz, real clock)  [Coolbits]",
+                                   -150, 400, 0, 5)
         self.fan_on = Gtk.CheckButton(label="Manual fan  [Coolbits]")
         root.append(self.fan_on)
         self.s_fan = self._slider(root, "Fan speed (%)", 0, 100, 50, 5)
@@ -451,7 +455,7 @@ class Win(Gtk.ApplicationWindow):
         self.readout["power"].set_text(f"{p:.0f}W")
         self.readout["util"].set_text(f"{u:.0f}%")
         self.readout["core"].set_text(f"{num(d['clocks.gr']):.0f}")
-        self.readout["mem"].set_text(f"{num(d['clocks.mem']):.0f}")
+        self.readout["mem"].set_text(f"{num(d['clocks.mem'])/MEM_CLOCK_RATIO:.0f}")
         self.readout["vram"].set_text(f"{num(d['memory.used'])/1024:.1f}G")
         fan = d["fan.speed"]
         self.readout["fan"].set_text(f"{fan}%" if fan not in ("N/A", "[N/A]") else "—")

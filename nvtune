@@ -28,6 +28,16 @@ from pathlib import Path
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
 SYSTEMD_UNIT = Path("/etc/systemd/system/nvtune-profile.service")
 
+# GDDR6 memory clock convention: nvidia-smi reports 4x the real (GPU-Z / GPU-T
+# base) clock — e.g. it shows 6800 MHz where the real clock is 1700 MHz
+# (real = smi * 2 / 8 for GDDR6's 8n prefetch). We display the real clock and
+# scale the memory OFFSET by the same factor, so a "+100 MHz" offset means
+# +100 MHz on the displayed real clock. NOTE: the offset scaling could not be
+# hardware-verified on a headless box (nvidia-settings rejects clock offsets
+# without a real display head); if a bench shows the applied delta is off by 2x,
+# adjust MEM_CLOCK_RATIO.
+MEM_CLOCK_RATIO = 4
+
 # ---------------------------------------------------------------- helpers ----
 
 def _run(cmd, check=False, capture=True):
@@ -209,7 +219,7 @@ def cmd_monitor(args):
                 f"{_num(d['utilization.gpu']):.0f}%",
                 f"{_num(d['utilization.memory']):.0f}%",
                 f"{_num(d['clocks.gr']):.0f}/{_num(d['clocks.max.gr']):.0f}",
-                f"{_num(d['clocks.mem']):.0f}/{_num(d['clocks.max.mem']):.0f}",
+                f"{_num(d['clocks.mem'])/MEM_CLOCK_RATIO:.0f}/{_num(d['clocks.max.mem'])/MEM_CLOCK_RATIO:.0f}",
                 f"{_num(d['memory.used'])/1024:.1f}/{_num(d['memory.total'])/1024:.1f}G",
                 f"{d['fan.speed']}%" if d['fan.speed'] not in ("N/A", "[N/A]") else "—",
                 d["pstate"],
@@ -299,10 +309,13 @@ def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
         if gpu_offset is not None:
             args_ns += ["-a", f"[gpu:{gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels={gpu_offset}"]
         if mem_offset is not None:
-            args_ns += ["-a", f"[gpu:{gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels={mem_offset}"]
+            # mem_offset is given in real-clock MHz (matching the displayed clock);
+            # nvidia-settings wants it in the nvidia-smi convention, so scale up.
+            ns_mem_offset = int(mem_offset) * MEM_CLOCK_RATIO
+            args_ns += ["-a", f"[gpu:{gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels={ns_mem_offset}"]
         r = subprocess.run(_as_root(args_ns), text=True, capture_output=True, env=env)
         ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
-        results.append(("clock offset (gpu=%s mem=%s)" % (gpu_offset, mem_offset), ok,
+        results.append(("clock offset (gpu=%s mem=%s real MHz)" % (gpu_offset, mem_offset), ok,
                         (r.stdout + r.stderr).strip() if ok else _ns_fail_hint(r.stdout + r.stderr)))
 
     if fan is not None:
@@ -481,7 +494,7 @@ def build_parser():
     s.add_argument("--power", type=int, help="power limit in watts")
     s.add_argument("--lock-clock", help="lock core clock 'MIN,MAX' or 'FREQ'")
     s.add_argument("--gpu-offset", type=int, help="core clock offset MHz (needs Coolbits)")
-    s.add_argument("--mem-offset", type=int, help="mem transfer-rate offset MHz (needs Coolbits)")
+    s.add_argument("--mem-offset", type=int, help="memory clock offset MHz, real/GPU-Z scale (needs Coolbits)")
     s.add_argument("--fan", type=int, help="fan speed %% (needs Coolbits)")
     s.set_defaults(func=cmd_set)
 
