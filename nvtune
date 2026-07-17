@@ -51,6 +51,90 @@ def require_nvsmi():
     if not have("nvidia-smi"):
         die("nvidia-smi not found (install the NVIDIA driver).")
 
+# ------------------------------------------------------------- NVAPI temps ----
+# nvidia-smi/NVML do not expose GPU hotspot or VRAM (memory) temperature on
+# GeForce cards. NVIDIA's Linux driver (>=555) ships libnvidia-api.so.1 which
+# provides NVAPI; its internal thermal query returns per-sensor temps. We read
+# the hotspot (index 9) and VRAM (index 15) sensors, fixed-point /256.
+# Read-only; no root needed. Silently disabled if the library is unavailable.
+
+class _NvAPI:
+    Q_INIT, Q_ENUM, Q_BUSID, Q_THERM = 0x0150e828, 0xe5ac921f, 0x1be0b8e5, 0x65fe3aad
+
+    def __init__(self):
+        self.ok = False
+        try:
+            import ctypes as C
+            lib = C.CDLL("libnvidia-api.so.1")
+            lib.nvapi_QueryInterface.restype = C.c_void_p
+            lib.nvapi_QueryInterface.argtypes = [C.c_uint]
+            def qi(i):
+                p = lib.nvapi_QueryInterface(i)
+                if not p:
+                    raise OSError("nvapi symbol missing")
+                return p
+
+            class TH(C.Structure):
+                _pack_ = 1
+                _fields_ = [("version", C.c_uint), ("mask", C.c_int),
+                            ("values", C.c_int * 40)]
+            self.C, self.TH = C, TH
+            self._init  = C.CFUNCTYPE(C.c_int)(qi(self.Q_INIT))
+            self._enum  = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_ENUM))
+            self._busid = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_BUSID))
+            self._therm = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(TH))(qi(self.Q_THERM))
+            if self._init() != 0:
+                raise OSError("NvAPI_Initialize failed")
+            self.handles = (C.c_void_p * 64)()
+            self.count = C.c_uint(0)
+            if self._enum(self.handles, C.byref(self.count)) != 0 or self.count.value == 0:
+                raise OSError("EnumPhysicalGPUs failed")
+            self.ver = C.sizeof(TH) | (2 << 16)
+            mt = TH(version=self.ver, mask=1)
+            self.mask = 0x3fff
+            for bit in range(32):
+                mt.mask = 1 << bit
+                if self._therm(self.handles[0], C.byref(mt)) != 0:
+                    self.mask = mt.mask - 1
+                    break
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def temps(self, bus=None):
+        if not self.ok:
+            return None
+        C = self.C
+        h = self.handles[0]
+        if bus is not None:
+            for i in range(self.count.value):
+                b = C.c_uint(0)
+                if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
+                    h = self.handles[i]
+                    break
+        s = self.TH(version=self.ver, mask=self.mask)
+        if self._therm(h, C.byref(s)) != 0:
+            return None
+        hot, vr = s.values[9] // 256, s.values[15] // 256
+        return {"hotspot": hot if 0 < hot < 255 else None,
+                "vram": vr if 0 < vr < 255 else None}
+
+_nvapi = None
+
+def nvapi_temps(bus=None):
+    """Return {'hotspot':C,'vram':C} for the GPU on PCI `bus` (int), or None."""
+    global _nvapi
+    if _nvapi is None:
+        _nvapi = _NvAPI()
+    return _nvapi.temps(bus)
+
+def _bus_of(bus_id):
+    """Parse nvidia-smi pci.bus_id ('00000000:82:00.0') -> bus number int (0x82)."""
+    try:
+        return int(bus_id.split(":")[-3], 16)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
 # ------------------------------------------------------------- gpu queries ----
 
 QFIELDS = [
@@ -58,7 +142,7 @@ QFIELDS = [
     "power.default_limit", "power.min_limit", "power.max_limit",
     "utilization.gpu", "utilization.memory",
     "clocks.gr", "clocks.max.gr", "clocks.mem", "clocks.max.mem",
-    "memory.used", "memory.total", "fan.speed", "pstate",
+    "memory.used", "memory.total", "fan.speed", "pstate", "pci.bus_id",
 ]
 
 def query(index=0):
@@ -99,16 +183,28 @@ def cmd_monitor(args):
     def render():
         t = Table(box=box.SIMPLE_HEAVY, title="nvtune — NVIDIA live monitor",
                   title_style="bold cyan", expand=True)
-        for col in ("GPU", "Temp", "Power", "GPU%", "Mem%",
+        for col in ("GPU", "Temp", "Hot", "Tmem", "Power", "GPU%", "Mem%",
                     "Core clk", "Mem clk", "VRAM", "Fan", "Pstate"):
             t.add_column(col, justify="right")
         for idx, _ in list_gpus():
             d = query(idx)
             temp = _num(d["temperature.gpu"])
             tcol = "green" if temp < 65 else "yellow" if temp < 80 else "red"
+
+            def _tcell(v, warn, hot):
+                if v is None:
+                    return "—"
+                c = "green" if v < warn else "yellow" if v < hot else "red"
+                return f"[{c}]{v:.0f}°C[/]"
+            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
+            hot_c = _tcell(nv.get("hotspot"), 85, 100)
+            tmem_c = _tcell(nv.get("vram"), 85, 95)
+
             t.add_row(
                 f"{d['index']} {d['name'].replace('NVIDIA ', '')[:18]}",
                 f"[{tcol}]{temp:.0f}°C[/]",
+                hot_c,
+                tmem_c,
                 f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W",
                 f"{_num(d['utilization.gpu']):.0f}%",
                 f"{_num(d['utilization.memory']):.0f}%",
@@ -132,8 +228,16 @@ def _monitor_plain(args):
     try:
         while True:
             d = query(args.gpu)
+            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
+            hs = nv.get("hotspot")
+            vt = nv.get("vram")
+            extra = ""
+            if hs is not None:
+                extra += f"  hot {hs:.0f}°C"
+            if vt is not None:
+                extra += f"  vram {vt:.0f}°C"
             print(f"\r{d['name'].replace('NVIDIA ','')}: "
-                  f"{_num(d['temperature.gpu']):.0f}°C  "
+                  f"{_num(d['temperature.gpu']):.0f}°C{extra}  "
                   f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W  "
                   f"gpu {_num(d['utilization.gpu']):.0f}%  "
                   f"core {_num(d['clocks.gr']):.0f}MHz  "
@@ -315,6 +419,8 @@ fps
 frametime
 gpu_stats
 gpu_temp
+gpu_junction_temp
+gpu_mem_temp
 gpu_core_clock
 gpu_mem_clock
 gpu_power
