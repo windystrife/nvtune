@@ -17,7 +17,7 @@ Comes in two flavours: a **graphical tuner** (`nvtune-gui`, GTK4 — sliders, li
 
 ## Features
 
-* **GUI** (`nvtune-gui`) — Afterburner-style window: live readouts + rolling graph, sliders for power/clock/offsets/fan, Apply/Reset, profiles, overlay toggle
+* **GUI** (`nvtune-gui`) — Afterburner-style window: live readouts + rolling graph, a **drag-to-set clock/voltage curve** panel, sliders for power/clock/offsets/fan, Apply/Reset, profiles, overlay toggle
 * **monitor** — live TUI dashboard (temp, power, clocks, util, VRAM, fan)
 * **undervolt / set** — power limit, GPU-clock lock, clock & memory offsets, fan
 * **reset** — revert everything to stock
@@ -83,7 +83,7 @@ Có 2 dạng: **GUI đồ hoạ** (`nvtune-gui`, GTK4 — slider, đồ thị li
 
 ## Tính năng
 
-* **GUI** (`nvtune-gui`) — cửa sổ kiểu Afterburner: readout live + đồ thị, slider power/clock/offset/quạt, Apply/Reset, profile, bật OSD
+* **GUI** (`nvtune-gui`) — cửa sổ kiểu Afterburner: readout live + đồ thị, **curve clock/voltage kéo được** (kéo = đặt lock clock), slider power/clock/offset/quạt, Apply/Reset, profile, bật OSD
 * **monitor** — bảng TUI live (nhiệt độ, điện, clock, tải, VRAM, quạt)
 * **undervolt / set** — power limit, khoá clock GPU, offset clock & mem, quạt
 * **reset** — về stock

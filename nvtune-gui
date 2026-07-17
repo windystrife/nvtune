@@ -85,16 +85,90 @@ class Graph(Gtk.DrawingArea):
         line(self.temp, (0.90, 0.35, 0.35), 100)   # temp  red (0..100°C)
 
 
+# ------------------------------------------------------------- curve editor ----
+class CurveEditor(Gtk.DrawingArea):
+    """Afterburner-style clock/voltage curve. The NVIDIA Linux driver exposes no
+    real V/F points, so this drives the two levers that ARE available: a locked
+    target clock (the flat line = flattened curve) and a global clock offset
+    (shifts the curve). Drag vertically to set the locked target clock."""
+    def __init__(self, on_clock):
+        super().__init__()
+        self.set_content_height(280)
+        self.set_hexpand(True)
+        self.on_clock = on_clock
+        self.vmin, self.vmax = 650, 1100    # mV (reference axis only)
+        self.cmin, self.cmax = 300, 2200    # MHz
+        self.lock = None
+        self.offset = 0
+        self._h = 280
+        self.set_draw_func(self._draw)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", lambda g, x, y: self.on_clock(self._y2c(y)))
+        drag.connect("drag-update", self._drag)
+        self.add_controller(drag)
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda g, n, x, y: self.on_clock(self._y2c(y)))
+        self.add_controller(click)
+
+    def set_state(self, lock, offset):
+        self.lock, self.offset = lock, offset
+        self.queue_draw()
+
+    def _y2c(self, y):
+        h = self.get_height() or self._h
+        frac = 1 - max(0.0, min(1.0, y / h))
+        return int(round((self.cmin + frac * (self.cmax - self.cmin)) / 15) * 15)
+
+    def _drag(self, g, dx, dy):
+        ok, sx, sy = g.get_start_point()
+        self.on_clock(self._y2c(sy + dy))
+
+    def _draw(self, area, cr, w, h):
+        self._h = h
+        cr.set_source_rgb(0.08, 0.09, 0.11); cr.paint()
+        def X(v): return (v - self.vmin) / (self.vmax - self.vmin) * w
+        def Y(c): return h - (c - self.cmin) / (self.cmax - self.cmin) * h
+        cr.select_font_face("monospace"); cr.set_font_size(10); cr.set_line_width(1)
+        for c in range(500, 2300, 300):
+            cr.set_source_rgb(0.18, 0.19, 0.22)
+            cr.move_to(0, Y(c)); cr.line_to(w, Y(c)); cr.stroke()
+            cr.set_source_rgb(0.5, 0.5, 0.55); cr.move_to(3, Y(c) - 3); cr.show_text(str(c))
+        for v in range(700, 1101, 50):
+            cr.set_source_rgb(0.18, 0.19, 0.22)
+            cr.move_to(X(v), 0); cr.line_to(X(v), h); cr.stroke()
+        # illustrative reference boost curve (dashed) shifted by the offset
+        cr.set_source_rgba(0.55, 0.55, 0.6, 0.7); cr.set_line_width(1.5); cr.set_dash([4, 3])
+        for i, (v, c) in enumerate([(700, 1350), (760, 1500), (830, 1650), (900, 1780),
+                                    (960, 1880), (1010, 1960), (1060, 2010)]):
+            (cr.move_to if i == 0 else cr.line_to)(X(v), Y(c + self.offset))
+        cr.stroke(); cr.set_dash([])
+        # applied lock line (the undervolt target)
+        if self.lock:
+            ly = Y(min(self.lock + self.offset, self.cmax))
+            cr.set_source_rgb(0.30, 0.85, 0.95); cr.set_line_width(2.5); cr.set_dash([6, 4])
+            cr.move_to(0, ly); cr.line_to(w, ly); cr.stroke(); cr.set_dash([])
+            cr.arc(X(760), ly, 5, 0, 6.2832); cr.fill()
+            lbl = f"{self.lock} MHz" + (f"   +{self.offset}" if self.offset else "")
+            cr.set_source_rgb(0.12, 0.42, 0.5); cr.rectangle(X(760) + 8, ly - 17, len(lbl) * 7 + 10, 16); cr.fill()
+            cr.set_source_rgb(1, 1, 1); cr.move_to(X(760) + 12, ly - 5); cr.show_text(lbl)
+        cr.set_source_rgb(0.5, 0.5, 0.55)
+        cr.move_to(w - 118, h - 6); cr.show_text("mV (reference)")
+        cr.move_to(6, 14); cr.show_text("MHz — drag to set locked clock")
+
+
 # ----------------------------------------------------------------- main win ----
 class Win(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="nvtune — NVIDIA tuner")
-        self.set_default_size(560, 720)
+        self.set_default_size(600, 860)
         self.coolbits = self._coolbits_available()
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                        margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
-        self.set_child(root)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(root)
+        self.set_child(scroller)
 
         info = nvsmi(["name"])
         title = Gtk.Label(xalign=0)
@@ -128,6 +202,18 @@ class Win(Gtk.ApplicationWindow):
 
         root.append(Gtk.Separator())
 
+        # clock / voltage curve (Afterburner-style)
+        chdr = Gtk.Label(xalign=0)
+        chdr.set_markup("<b>Clock / Voltage curve</b>  "
+                        "<small>drag the line = locked clock · +offset shifts it "
+                        "(no real V/F on Linux)</small>")
+        root.append(chdr)
+        self.curve = CurveEditor(self._curve_clock)
+        cf = Gtk.Frame(); cf.set_child(self.curve)
+        root.append(cf)
+
+        root.append(Gtk.Separator())
+
         # tuning sliders
         gmin, gmax = self._power_range()
         self.s_power = self._slider(root, "Power limit (W)", gmin, gmax,
@@ -147,6 +233,12 @@ class Win(Gtk.ApplicationWindow):
         if not self.coolbits:
             for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
                 w.set_sensitive(False)
+
+        # keep the V/F curve in sync with the lock / clock / offset controls
+        self.lock_on.connect("toggled", self._sync_curve)
+        self.s_clock.connect("value-changed", self._sync_curve)
+        self.s_goff.connect("value-changed", self._sync_curve)
+        self._sync_curve()
 
         # action buttons
         acts = Gtk.Box(spacing=8, margin_top=6)
@@ -189,6 +281,19 @@ class Win(Gtk.ApplicationWindow):
         self.graph = Graph()
         f = Gtk.Frame(); f.set_child(self.graph)
         return f
+
+    def _curve_clock(self, mhz):
+        """Curve callback: dragging the line sets the locked target clock."""
+        lo, hi = self._clock_range()
+        mhz = max(lo, min(hi, mhz))
+        self.lock_on.set_active(True)
+        self.s_clock.set_value(mhz)      # fires value-changed -> _sync_curve
+        self._sync_curve()
+
+    def _sync_curve(self, *_):
+        lock = int(self.s_clock.get_value()) if self.lock_on.get_active() else None
+        off = int(self.s_goff.get_value()) if self.coolbits else 0
+        self.curve.set_state(lock, off)
 
     def _slider(self, parent, label, lo, hi, val, step):
         parent.append(Gtk.Label(label=label, xalign=0))
