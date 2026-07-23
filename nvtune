@@ -13,10 +13,18 @@ Features
 Undervolt note (Linux/NVIDIA): the driver exposes no voltage curve. The
 effective "undervolt" is to LOCK the GPU clock (nvidia-smi -lgc) and cap the
 power limit (-pl); the GPU then runs that clock at the lowest voltage it needs.
-An optional positive clock offset (needs Xorg "Coolbits") lets the same voltage
-reach a higher clock. This tool wraps all of that.
+An optional positive clock offset lets the same voltage reach a higher clock.
+This tool wraps all of that.
+
+Fan speed and clock offsets go through NVML (libnvidia-ml), which ships with
+the driver and therefore always matches it, and needs no X server, no Coolbits
+and no attached display. nvidia-settings is kept only as a fallback for drivers
+too old to have the NVML setters: distros commonly ship an nvidia-settings far
+older than the driver (510 vs 595 here), and the mismatch makes its writes fail
+with a bare "Unknown Error".
 """
 import argparse
+import ctypes
 import json
 import os
 import shutil
@@ -27,16 +35,7 @@ from pathlib import Path
 
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
 SYSTEMD_UNIT = Path("/etc/systemd/system/nvtune-profile.service")
-
-# GDDR6 memory clock convention: nvidia-smi reports 4x the real (GPU-Z / GPU-T
-# base) clock — e.g. it shows 6800 MHz where the real clock is 1700 MHz
-# (real = smi * 2 / 8 for GDDR6's 8n prefetch). We display the real clock and
-# scale the memory OFFSET by the same factor, so a "+100 MHz" offset means
-# +100 MHz on the displayed real clock. NOTE: the offset scaling could not be
-# hardware-verified on a headless box (nvidia-settings rejects clock offsets
-# without a real display head); if a bench shows the applied delta is off by 2x,
-# adjust MEM_CLOCK_RATIO.
-MEM_CLOCK_RATIO = 4
+SELF = os.path.abspath(sys.argv[0])
 
 # ---------------------------------------------------------------- helpers ----
 
@@ -61,90 +60,6 @@ def require_nvsmi():
     if not have("nvidia-smi"):
         die("nvidia-smi not found (install the NVIDIA driver).")
 
-# ------------------------------------------------------------- NVAPI temps ----
-# nvidia-smi/NVML do not expose GPU hotspot or VRAM (memory) temperature on
-# GeForce cards. NVIDIA's Linux driver (>=555) ships libnvidia-api.so.1 which
-# provides NVAPI; its internal thermal query returns per-sensor temps. We read
-# the hotspot (index 9) and VRAM (index 15) sensors, fixed-point /256.
-# Read-only; no root needed. Silently disabled if the library is unavailable.
-
-class _NvAPI:
-    Q_INIT, Q_ENUM, Q_BUSID, Q_THERM = 0x0150e828, 0xe5ac921f, 0x1be0b8e5, 0x65fe3aad
-
-    def __init__(self):
-        self.ok = False
-        try:
-            import ctypes as C
-            lib = C.CDLL("libnvidia-api.so.1")
-            lib.nvapi_QueryInterface.restype = C.c_void_p
-            lib.nvapi_QueryInterface.argtypes = [C.c_uint]
-            def qi(i):
-                p = lib.nvapi_QueryInterface(i)
-                if not p:
-                    raise OSError("nvapi symbol missing")
-                return p
-
-            class TH(C.Structure):
-                _pack_ = 1
-                _fields_ = [("version", C.c_uint), ("mask", C.c_int),
-                            ("values", C.c_int * 40)]
-            self.C, self.TH = C, TH
-            self._init  = C.CFUNCTYPE(C.c_int)(qi(self.Q_INIT))
-            self._enum  = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_ENUM))
-            self._busid = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_BUSID))
-            self._therm = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(TH))(qi(self.Q_THERM))
-            if self._init() != 0:
-                raise OSError("NvAPI_Initialize failed")
-            self.handles = (C.c_void_p * 64)()
-            self.count = C.c_uint(0)
-            if self._enum(self.handles, C.byref(self.count)) != 0 or self.count.value == 0:
-                raise OSError("EnumPhysicalGPUs failed")
-            self.ver = C.sizeof(TH) | (2 << 16)
-            mt = TH(version=self.ver, mask=1)
-            self.mask = 0x3fff
-            for bit in range(32):
-                mt.mask = 1 << bit
-                if self._therm(self.handles[0], C.byref(mt)) != 0:
-                    self.mask = mt.mask - 1
-                    break
-            self.ok = True
-        except Exception:
-            self.ok = False
-
-    def temps(self, bus=None):
-        if not self.ok:
-            return None
-        C = self.C
-        h = self.handles[0]
-        if bus is not None:
-            for i in range(self.count.value):
-                b = C.c_uint(0)
-                if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
-                    h = self.handles[i]
-                    break
-        s = self.TH(version=self.ver, mask=self.mask)
-        if self._therm(h, C.byref(s)) != 0:
-            return None
-        hot, vr = s.values[9] // 256, s.values[15] // 256
-        return {"hotspot": hot if 0 < hot < 255 else None,
-                "vram": vr if 0 < vr < 255 else None}
-
-_nvapi = None
-
-def nvapi_temps(bus=None):
-    """Return {'hotspot':C,'vram':C} for the GPU on PCI `bus` (int), or None."""
-    global _nvapi
-    if _nvapi is None:
-        _nvapi = _NvAPI()
-    return _nvapi.temps(bus)
-
-def _bus_of(bus_id):
-    """Parse nvidia-smi pci.bus_id ('00000000:82:00.0') -> bus number int (0x82)."""
-    try:
-        return int(bus_id.split(":")[-3], 16)
-    except (ValueError, IndexError, AttributeError):
-        return None
-
 # ------------------------------------------------------------- gpu queries ----
 
 QFIELDS = [
@@ -152,7 +67,7 @@ QFIELDS = [
     "power.default_limit", "power.min_limit", "power.max_limit",
     "utilization.gpu", "utilization.memory",
     "clocks.gr", "clocks.max.gr", "clocks.mem", "clocks.max.mem",
-    "memory.used", "memory.total", "fan.speed", "pstate", "pci.bus_id",
+    "memory.used", "memory.total", "fan.speed", "pstate",
 ]
 
 def query(index=0):
@@ -193,33 +108,21 @@ def cmd_monitor(args):
     def render():
         t = Table(box=box.SIMPLE_HEAVY, title="nvtune — NVIDIA live monitor",
                   title_style="bold cyan", expand=True)
-        for col in ("GPU", "Temp", "Hot", "Tmem", "Power", "GPU%", "Mem%",
+        for col in ("GPU", "Temp", "Power", "GPU%", "Mem%",
                     "Core clk", "Mem clk", "VRAM", "Fan", "Pstate"):
             t.add_column(col, justify="right")
         for idx, _ in list_gpus():
             d = query(idx)
             temp = _num(d["temperature.gpu"])
             tcol = "green" if temp < 65 else "yellow" if temp < 80 else "red"
-
-            def _tcell(v, warn, hot):
-                if v is None:
-                    return "—"
-                c = "green" if v < warn else "yellow" if v < hot else "red"
-                return f"[{c}]{v:.0f}°C[/]"
-            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
-            hot_c = _tcell(nv.get("hotspot"), 85, 100)
-            tmem_c = _tcell(nv.get("vram"), 85, 95)
-
             t.add_row(
                 f"{d['index']} {d['name'].replace('NVIDIA ', '')[:18]}",
                 f"[{tcol}]{temp:.0f}°C[/]",
-                hot_c,
-                tmem_c,
                 f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W",
                 f"{_num(d['utilization.gpu']):.0f}%",
                 f"{_num(d['utilization.memory']):.0f}%",
                 f"{_num(d['clocks.gr']):.0f}/{_num(d['clocks.max.gr']):.0f}",
-                f"{_num(d['clocks.mem'])/MEM_CLOCK_RATIO:.0f}/{_num(d['clocks.max.mem'])/MEM_CLOCK_RATIO:.0f}",
+                f"{_num(d['clocks.mem']):.0f}/{_num(d['clocks.max.mem']):.0f}",
                 f"{_num(d['memory.used'])/1024:.1f}/{_num(d['memory.total'])/1024:.1f}G",
                 f"{d['fan.speed']}%" if d['fan.speed'] not in ("N/A", "[N/A]") else "—",
                 d["pstate"],
@@ -238,16 +141,8 @@ def _monitor_plain(args):
     try:
         while True:
             d = query(args.gpu)
-            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
-            hs = nv.get("hotspot")
-            vt = nv.get("vram")
-            extra = ""
-            if hs is not None:
-                extra += f"  hot {hs:.0f}°C"
-            if vt is not None:
-                extra += f"  vram {vt:.0f}°C"
             print(f"\r{d['name'].replace('NVIDIA ','')}: "
-                  f"{_num(d['temperature.gpu']):.0f}°C{extra}  "
+                  f"{_num(d['temperature.gpu']):.0f}°C  "
                   f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W  "
                   f"gpu {_num(d['utilization.gpu']):.0f}%  "
                   f"core {_num(d['clocks.gr']):.0f}MHz  "
@@ -271,15 +166,110 @@ def _mark(ok):
 def _ns_fail_hint(out):
     """Turn a failed nvidia-settings assignment into an actionable message.
     nvidia-settings returns exit 0 even when an assignment fails, so callers
-    must scan the text for 'ERROR' — and the usual headless failure is the
-    opaque '(Unknown Error)' on fan / clock-offset, which really means the
-    GPU has no real display head driving pixels."""
+    must scan the text for 'ERROR'. The opaque '(Unknown Error)' almost always
+    means the nvidia-settings binary is older than the running driver."""
     out = (out or "").strip()
     if "Unknown Error" in out:
-        return ("needs a real display head — attach a monitor or a cheap "
-                "HDMI/DP dummy plug; a virtual/CustomEDID display is not "
-                "enough for fan/offset control")
+        return ("nvidia-settings is older than the driver, so its writes are "
+                "rejected — and this driver has no NVML setter either; upgrade "
+                "nvidia-settings to match the driver")
     return out or "needs Xorg + Coolbits"
+
+
+# -------------------------------------------------------------------- nvml ----
+# Preferred path for fan + clock offsets. Runs in-process, but the setters need
+# root, so callers re-invoke this script through sudo (the hidden `_nvml`
+# subcommand) exactly like the nvidia-smi calls are elevated.
+
+NVML_ERR = {3: "not supported by this driver/GPU", 4: "no permission (needs root)"}
+
+
+def nvml_open(gpu):
+    """Return (lib, handle) for a GPU, or raise OSError."""
+    lib = ctypes.CDLL("libnvidia-ml.so.1")          # ships with the driver
+    if lib.nvmlInit_v2() != 0:
+        raise OSError("nvmlInit failed")
+    h = ctypes.c_void_p()
+    if lib.nvmlDeviceGetHandleByIndex_v2(gpu, ctypes.byref(h)) != 0:
+        raise OSError(f"no NVML handle for GPU {gpu}")
+    lib.nvmlDeviceSetGpcClkVfOffset.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.nvmlDeviceSetMemClkVfOffset.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    return lib, h
+
+
+def nvml_capable():
+    """True when this driver's NVML can actually set fan / offsets."""
+    try:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError:
+        return False
+    return all(hasattr(lib, s) for s in
+               ("nvmlDeviceSetFanSpeed_v2", "nvmlDeviceSetGpcClkVfOffset"))
+
+
+def _nvml_root(gpu, *flags):
+    """Run the hidden `_nvml` subcommand as root. Returns (ok, detail)."""
+    if not nvml_capable():
+        return False, "NVML setters unavailable (driver too old)"
+    r = _run(_as_root([SELF, "-i", str(gpu), "_nvml", *map(str, flags)]))
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def _ns_offsets(gpu, gpu_offset, mem_offset):
+    """Legacy clock-offset path via nvidia-settings (needs Xorg + Coolbits)."""
+    env = dict(os.environ); env.setdefault("DISPLAY", ":0")
+    args_ns = ["nvidia-settings"]
+    if gpu_offset is not None:
+        args_ns += ["-a", f"[gpu:{gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels={gpu_offset}"]
+    if mem_offset is not None:
+        args_ns += ["-a", f"[gpu:{gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels={mem_offset}"]
+    r = subprocess.run(_as_root(args_ns), text=True, capture_output=True, env=env)
+    ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
+    return ok, ((r.stdout + r.stderr).strip() if ok
+                else _ns_fail_hint(r.stdout + r.stderr))
+
+
+def _ns_fan(gpu, fan):
+    """Legacy fan path via nvidia-settings (needs Xorg + Coolbits)."""
+    env = dict(os.environ); env.setdefault("DISPLAY", ":0")
+    ns = ["nvidia-settings",
+          "-a", f"[gpu:{gpu}]/GPUFanControlState=1",
+          "-a", f"[fan:{gpu}]/GPUTargetFanSpeed={fan}"]
+    r = subprocess.run(_as_root(ns), text=True, capture_output=True, env=env)
+    ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
+    return ok, ((r.stdout + r.stderr).strip() if ok
+                else _ns_fail_hint(r.stdout + r.stderr))
+
+
+def cmd_nvml(args):
+    """Hidden: do the NVML writes in-process. Re-invoked through sudo."""
+    try:
+        lib, h = nvml_open(args.gpu)
+    except OSError as e:
+        print(f"NVML unavailable: {e}")
+        return 1
+    rc = 0
+
+    def chk(what, code):
+        nonlocal rc
+        if code != 0:
+            rc = 1
+            print(f"{what}: NVML error {code} "
+                  f"({NVML_ERR.get(code, 'see nvmlReturn_t')})")
+
+    if args.fan_auto:
+        chk("fan auto", lib.nvmlDeviceSetDefaultFanSpeed_v2(h, 0))
+    if args.fan is not None:
+        n = ctypes.c_uint()
+        if lib.nvmlDeviceGetNumFans(h, ctypes.byref(n)) != 0:
+            n.value = 1
+        for i in range(max(1, n.value)):        # keep every fan in step
+            chk(f"fan {i}", lib.nvmlDeviceSetFanSpeed_v2(h, i, args.fan))
+    if args.gpu_offset is not None:
+        chk("gpu offset", lib.nvmlDeviceSetGpcClkVfOffset(h, args.gpu_offset))
+    if args.mem_offset is not None:
+        chk("mem offset", lib.nvmlDeviceSetMemClkVfOffset(h, args.mem_offset))
+    return rc
 
 
 def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
@@ -301,32 +291,24 @@ def apply_settings(gpu, power=None, lock_clock=None, gpu_offset=None,
         results.append(("lock core clock %s" % lock_clock, r.returncode == 0,
                         (r.stdout + r.stderr).strip()))
 
-    # clock offsets go through nvidia-settings and need Xorg + Coolbits
+    # clock offsets: NVML first, legacy nvidia-settings only if NVML can't
     if gpu_offset is not None or mem_offset is not None:
-        env = dict(os.environ)
-        env.setdefault("DISPLAY", ":0")
-        args_ns = ["nvidia-settings"]
+        flags = []
         if gpu_offset is not None:
-            args_ns += ["-a", f"[gpu:{gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels={gpu_offset}"]
+            flags += ["--gpu-offset", gpu_offset]
         if mem_offset is not None:
-            # mem_offset is given in real-clock MHz (matching the displayed clock);
-            # nvidia-settings wants it in the nvidia-smi convention, so scale up.
-            ns_mem_offset = int(mem_offset) * MEM_CLOCK_RATIO
-            args_ns += ["-a", f"[gpu:{gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels={ns_mem_offset}"]
-        r = subprocess.run(_as_root(args_ns), text=True, capture_output=True, env=env)
-        ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
-        results.append(("clock offset (gpu=%s mem=%s real MHz)" % (gpu_offset, mem_offset), ok,
-                        (r.stdout + r.stderr).strip() if ok else _ns_fail_hint(r.stdout + r.stderr)))
+            flags += ["--mem-offset", mem_offset]
+        ok, detail = _nvml_root(gpu, *flags)
+        if not ok:
+            ok, detail = _ns_offsets(gpu, gpu_offset, mem_offset)
+        results.append(("clock offset (gpu=%s mem=%s)" % (gpu_offset, mem_offset),
+                        ok, detail))
 
     if fan is not None:
-        env = dict(os.environ); env.setdefault("DISPLAY", ":0")
-        ns = ["nvidia-settings",
-              "-a", f"[gpu:{gpu}]/GPUFanControlState=1",
-              "-a", f"[fan:{gpu}]/GPUTargetFanSpeed={fan}"]
-        r = subprocess.run(_as_root(ns), text=True, capture_output=True, env=env)
-        ok = r.returncode == 0 and "ERROR" not in (r.stdout + r.stderr)
-        results.append(("fan %s%%" % fan, ok,
-                        (r.stdout + r.stderr).strip() if ok else _ns_fail_hint(r.stdout + r.stderr)))
+        ok, detail = _nvml_root(gpu, "--fan", fan)
+        if not ok:
+            ok, detail = _ns_fan(gpu, fan)
+        results.append(("fan %s%%" % fan, ok, detail))
 
     if verbose:
         for label, ok, detail in results:
@@ -362,13 +344,18 @@ def cmd_reset(args):
     ]:
         r = _run(_as_root(cmd))
         print(f"  {_mark(r.returncode == 0)} {label}")
-    # zero the offsets (best effort, needs X)
-    env = dict(os.environ); env.setdefault("DISPLAY", ":0")
-    subprocess.run(_as_root(["nvidia-settings",
-        "-a", f"[gpu:{args.gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels=0",
-        "-a", f"[gpu:{args.gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels=0",
-        "-a", f"[gpu:{args.gpu}]/GPUFanControlState=0"]),
-        text=True, capture_output=True, env=env)
+    # zero the offsets and hand the fan back to the driver's own curve
+    ok, detail = _nvml_root(args.gpu, "--gpu-offset", 0, "--mem-offset", 0,
+                            "--fan-auto")
+    if not ok:
+        env = dict(os.environ); env.setdefault("DISPLAY", ":0")
+        subprocess.run(_as_root(["nvidia-settings",
+            "-a", f"[gpu:{args.gpu}]/GPUGraphicsClockOffsetAllPerformanceLevels=0",
+            "-a", f"[gpu:{args.gpu}]/GPUMemoryTransferRateOffsetAllPerformanceLevels=0",
+            "-a", f"[gpu:{args.gpu}]/GPUFanControlState=0"]),
+            text=True, capture_output=True, env=env)
+    print(f"  {_mark(ok)} offsets zeroed + fan back to auto"
+          + (f"   ({detail.splitlines()[-1]})" if not ok and detail else ""))
     print("  reset done")
 
 # ---------------------------------------------------------------- profiles ----
@@ -432,8 +419,6 @@ fps
 frametime
 gpu_stats
 gpu_temp
-gpu_junction_temp
-gpu_mem_temp
 gpu_core_clock
 gpu_mem_clock
 gpu_power
@@ -494,7 +479,7 @@ def build_parser():
     s.add_argument("--power", type=int, help="power limit in watts")
     s.add_argument("--lock-clock", help="lock core clock 'MIN,MAX' or 'FREQ'")
     s.add_argument("--gpu-offset", type=int, help="core clock offset MHz (needs Coolbits)")
-    s.add_argument("--mem-offset", type=int, help="memory clock offset MHz, real/GPU-Z scale (needs Coolbits)")
+    s.add_argument("--mem-offset", type=int, help="mem transfer-rate offset MHz (needs Coolbits)")
     s.add_argument("--fan", type=int, help="fan speed %% (needs Coolbits)")
     s.set_defaults(func=cmd_set)
 
@@ -520,6 +505,13 @@ def build_parser():
     a = sub.add_parser("autostart", help="apply a profile at every boot (systemd)")
     a.add_argument("name")
     a.set_defaults(func=cmd_autostart)
+
+    nv = sub.add_parser("_nvml", help=argparse.SUPPRESS)   # internal, via sudo
+    nv.add_argument("--fan", type=int)
+    nv.add_argument("--fan-auto", action="store_true")
+    nv.add_argument("--gpu-offset", type=int)
+    nv.add_argument("--mem-offset", type=int)
+    nv.set_defaults(func=cmd_nvml)
 
     o = sub.add_parser("osd", help="in-game overlay via MangoHud")
     o.add_argument("action", choices=["install", "config", "run"])

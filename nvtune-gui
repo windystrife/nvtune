@@ -13,6 +13,7 @@ import subprocess
 from collections import deque
 from pathlib import Path
 
+import ctypes
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
@@ -21,10 +22,6 @@ NVTUNE = shutil.which("nvtune") or str(Path.home() / "nvtune" / "nvtune")
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
 GPU = 0
 HIST = 120  # seconds of graph history
-# GDDR6: nvidia-smi reports 4x the real (GPU-Z-style) memory clock. Show the real
-# clock and treat the memory offset in the same real-clock units (the CLI scales
-# it back up for nvidia-settings). See nvtune CLI for the hardware-verify caveat.
-MEM_CLOCK_RATIO = 4
 
 
 # ------------------------------------------------------------- data helpers ----
@@ -51,90 +48,6 @@ def nvtune(*args):
     r = subprocess.run([NVTUNE, "-i", str(GPU), *map(str, args)],
                        capture_output=True, text=True)
     return r.returncode == 0, (r.stdout + r.stderr).strip()
-
-
-# ------------------------------------------------------------- NVAPI temps ----
-# Hotspot + VRAM temperature are not exposed by nvidia-smi/NVML on GeForce; read
-# them from NVAPI (libnvidia-api.so.1, driver >=555): thermal index 9 = hotspot,
-# 15 = VRAM, fixed-point /256. Read-only, no root. Disabled if unavailable.
-class _NvAPI:
-    Q_INIT, Q_ENUM, Q_BUSID, Q_THERM = 0x0150e828, 0xe5ac921f, 0x1be0b8e5, 0x65fe3aad
-
-    def __init__(self):
-        self.ok = False
-        try:
-            import ctypes as C
-            lib = C.CDLL("libnvidia-api.so.1")
-            lib.nvapi_QueryInterface.restype = C.c_void_p
-            lib.nvapi_QueryInterface.argtypes = [C.c_uint]
-
-            def qi(i):
-                p = lib.nvapi_QueryInterface(i)
-                if not p:
-                    raise OSError("nvapi symbol missing")
-                return p
-
-            class TH(C.Structure):
-                _pack_ = 1
-                _fields_ = [("version", C.c_uint), ("mask", C.c_int),
-                            ("values", C.c_int * 40)]
-            self.C, self.TH = C, TH
-            self._init = C.CFUNCTYPE(C.c_int)(qi(self.Q_INIT))
-            self._enum = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_ENUM))
-            self._busid = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_BUSID))
-            self._therm = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(TH))(qi(self.Q_THERM))
-            if self._init() != 0:
-                raise OSError("init failed")
-            self.handles = (C.c_void_p * 64)()
-            self.count = C.c_uint(0)
-            if self._enum(self.handles, C.byref(self.count)) != 0 or self.count.value == 0:
-                raise OSError("enum failed")
-            self.ver = C.sizeof(TH) | (2 << 16)
-            mt = TH(version=self.ver, mask=1)
-            self.mask = 0x3fff
-            for bit in range(32):
-                mt.mask = 1 << bit
-                if self._therm(self.handles[0], C.byref(mt)) != 0:
-                    self.mask = mt.mask - 1
-                    break
-            self.ok = True
-        except Exception:
-            self.ok = False
-
-    def temps(self, bus=None):
-        if not self.ok:
-            return None
-        C = self.C
-        h = self.handles[0]
-        if bus is not None:
-            for i in range(self.count.value):
-                b = C.c_uint(0)
-                if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
-                    h = self.handles[i]
-                    break
-        s = self.TH(version=self.ver, mask=self.mask)
-        if self._therm(h, C.byref(s)) != 0:
-            return None
-        hot, vr = s.values[9] // 256, s.values[15] // 256
-        return {"hotspot": hot if 0 < hot < 255 else None,
-                "vram": vr if 0 < vr < 255 else None}
-
-
-_nvapi = None
-
-
-def nvapi_temps(bus=None):
-    global _nvapi
-    if _nvapi is None:
-        _nvapi = _NvAPI()
-    return _nvapi.temps(bus)
-
-
-def _bus_of(bus_id):
-    try:
-        return int(bus_id.split(":")[-3], 16)
-    except (ValueError, IndexError, AttributeError):
-        return None
 
 
 # --------------------------------------------------------------- live graph ----
@@ -249,7 +162,7 @@ class Win(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="nvtune — NVIDIA tuner")
         self.set_default_size(600, 860)
-        self.coolbits = self._coolbits_available()
+        self.can_tune = self._tuning_available()
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                        margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
@@ -267,8 +180,7 @@ class Win(Gtk.ApplicationWindow):
         # live readout cards
         self.readout = {}
         cards = Gtk.Box(spacing=8, homogeneous=True)
-        for key, lbl in [("temp", "Temp"), ("hot", "Hot"), ("vtemp", "Tmem"),
-                         ("power", "Power"), ("util", "GPU"),
+        for key, lbl in [("temp", "Temp"), ("power", "Power"), ("util", "GPU"),
                          ("core", "Core"), ("mem", "Mem"), ("vram", "VRAM"),
                          ("fan", "Fan")]:
             b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -312,19 +224,19 @@ class Win(Gtk.ApplicationWindow):
         root.append(self.lock_on)
         self.s_clock = self._slider(root, "Locked core clock (MHz)", cmin, cmax,
                                     (cmin + cmax) // 2, 15)
-        self.s_goff = self._slider(root, "Core clock offset (MHz)  [Coolbits]",
+        self.s_goff = self._slider(root, "Core clock offset (MHz)",
                                    -200, 300, 0, 5)
-        self.s_moff = self._slider(root, "Memory offset (MHz, real clock)  [Coolbits]",
-                                   -150, 400, 0, 5)
-        self.fan_on = Gtk.CheckButton(label="Manual fan  [Coolbits]")
+        self.s_moff = self._slider(root, "Memory offset (MHz)",
+                                   -500, 1500, 0, 25)
+        self.fan_on = Gtk.CheckButton(label="Manual fan")
         root.append(self.fan_on)
         self.s_fan = self._slider(root, "Fan speed (%)", 0, 100, 50, 5)
-        hw_tip = ("Needs Coolbits AND a real display head (a monitor or a cheap "
-                  "HDMI/DP dummy plug). On a headless / virtual display the driver "
-                  "rejects fan & clock-offset with 'Unknown Error'.")
+        hw_tip = ("Driven through NVML, which ships with the driver: no X server, "
+                  "no Coolbits and no attached display needed. Applying needs root "
+                  "(nvtune elevates itself with sudo).")
         for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
             w.set_tooltip_text(hw_tip)
-        if not self.coolbits:
+        if not self.can_tune:
             for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
                 w.set_sensitive(False)
 
@@ -386,7 +298,7 @@ class Win(Gtk.ApplicationWindow):
 
     def _sync_curve(self, *_):
         lock = int(self.s_clock.get_value()) if self.lock_on.get_active() else None
-        off = int(self.s_goff.get_value()) if self.coolbits else 0
+        off = int(self.s_goff.get_value()) if self.can_tune else 0
         self.curve.set_state(lock, off)
 
     def _slider(self, parent, label, lo, hi, val, step):
@@ -427,7 +339,17 @@ class Win(Gtk.ApplicationWindow):
         cmax = int(num(d.get("clocks.max.gr"), 2100))
         return 300, cmax
 
-    def _coolbits_available(self):
+    def _tuning_available(self):
+        """Can we drive fan + clock offsets? NVML (shipped with the driver, no
+        X/Coolbits/display needed) is the real path; fall back to probing
+        nvidia-settings for drivers too old to expose the NVML setters."""
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            if all(hasattr(lib, s) for s in ("nvmlDeviceSetFanSpeed_v2",
+                                             "nvmlDeviceSetGpcClkVfOffset")):
+                return True
+        except OSError:
+            pass
         r = subprocess.run(["nvidia-settings", "-q", f"[gpu:{GPU}]/GPUGraphicsClockOffsetAllPerformanceLevels"],
                            capture_output=True, text=True,
                            env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")})
@@ -441,21 +363,17 @@ class Win(Gtk.ApplicationWindow):
     def refresh(self, *_):
         d = nvsmi(["temperature.gpu", "power.draw", "power.limit",
                    "utilization.gpu", "clocks.gr", "clocks.mem",
-                   "memory.used", "memory.total", "fan.speed", "pci.bus_id"])
+                   "memory.used", "memory.total", "fan.speed"])
         if not d:
             self.status.set_text("nvidia-smi not responding")
             return True
         t = num(d["temperature.gpu"]); p = num(d["power.draw"]); pl = num(d["power.limit"], 1)
         u = num(d["utilization.gpu"])
         self.readout["temp"].set_text(f"{t:.0f}°C")
-        nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
-        hs, vt = nv.get("hotspot"), nv.get("vram")
-        self.readout["hot"].set_text(f"{hs:.0f}°C" if hs is not None else "—")
-        self.readout["vtemp"].set_text(f"{vt:.0f}°C" if vt is not None else "—")
         self.readout["power"].set_text(f"{p:.0f}W")
         self.readout["util"].set_text(f"{u:.0f}%")
         self.readout["core"].set_text(f"{num(d['clocks.gr']):.0f}")
-        self.readout["mem"].set_text(f"{num(d['clocks.mem'])/MEM_CLOCK_RATIO:.0f}")
+        self.readout["mem"].set_text(f"{num(d['clocks.mem']):.0f}")
         self.readout["vram"].set_text(f"{num(d['memory.used'])/1024:.1f}G")
         fan = d["fan.speed"]
         self.readout["fan"].set_text(f"{fan}%" if fan not in ("N/A", "[N/A]") else "—")
@@ -471,7 +389,7 @@ class Win(Gtk.ApplicationWindow):
         args = ["set", "--power", int(self.s_power.get_value())]
         if self.lock_on.get_active():
             c = int(self.s_clock.get_value()); args += ["--lock-clock", f"{c},{c}"]
-        if self.coolbits:
+        if self.can_tune:
             if self.s_goff.get_value(): args += ["--gpu-offset", int(self.s_goff.get_value())]
             if self.s_moff.get_value(): args += ["--mem-offset", int(self.s_moff.get_value())]
             if self.fan_on.get_active(): args += ["--fan", int(self.s_fan.get_value())]
@@ -490,7 +408,7 @@ class Win(Gtk.ApplicationWindow):
         args = ["profile", "save", name, "--power", int(self.s_power.get_value())]
         if self.lock_on.get_active():
             c = int(self.s_clock.get_value()); args += ["--lock-clock", f"{c},{c}"]
-        if self.coolbits and self.s_goff.get_value():
+        if self.can_tune and self.s_goff.get_value():
             args += ["--gpu-offset", int(self.s_goff.get_value())]
         ok, out = nvtune(*args)
         if ok:

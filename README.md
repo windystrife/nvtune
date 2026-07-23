@@ -27,7 +27,7 @@ Comes in two flavours: a **graphical tuner** (`nvtune-gui`, GTK4 — sliders, li
 
 ## About "undervolting" on Linux + NVIDIA
 
-The NVIDIA Linux driver exposes **no voltage curve** (unlike Afterburner on Windows). The effective undervolt is to **lock the GPU clock** (`nvidia-smi -lgc`) and **cap the power limit** (`-pl`): the GPU then runs that clock at the lowest voltage it needs. An optional positive **clock offset** (needs Xorg `Coolbits`) lets the same voltage reach a higher clock. `nvtune` wraps all of this behind simple commands.
+The NVIDIA Linux driver exposes **no voltage curve** (unlike Afterburner on Windows). The effective undervolt is to **lock the GPU clock** (`nvidia-smi -lgc`) and **cap the power limit** (`-pl`): the GPU then runs that clock at the lowest voltage it needs. An optional positive **clock offset** (applied through NVML) lets the same voltage reach a higher clock. `nvtune` wraps all of this behind simple commands.
 
 ## Install
 
@@ -49,7 +49,7 @@ nvtune undervolt --clock 1800 --power 220
 
 # Fine control
 nvtune set --power 200 --lock-clock 300,1800    # power + clock range
-nvtune set --gpu-offset 100 --mem-offset 400    # clock offsets (needs Coolbits)
+nvtune set --gpu-offset 100 --mem-offset 400    # clock offsets (via NVML)
 nvtune reset                                    # back to stock
 
 # Profiles
@@ -68,7 +68,7 @@ Multiple GPUs: add `-i <index>` (e.g. `nvtune -i 1 monitor`).
 
 ## Notes
 
-* **Clock offsets & fan control** need Xorg's `Coolbits` enabled (add `Option "Coolbits" "28"` to the NVIDIA Device section and restart the display manager) **and** the GPU to be driving a **real display head** — a monitor or a cheap HDMI/DP dummy plug. On a headless box or a virtual/CustomEDID display the driver rejects them with `Unknown Error`. Power limit + clock lock work regardless.
+* **Clock offsets & fan control** go through **NVML** (`libnvidia-ml`, which ships with the driver): no X server, no `Coolbits` and **no attached display** — they work on a fully headless box. They do need root, which `nvtune` takes via `sudo`. `nvidia-settings` is kept only as a fallback for drivers too old to expose the NVML setters — beware that distros often ship an `nvidia-settings` far older than the driver (510 vs 595 here), and that mismatch makes its writes fail with a bare `Unknown Error`.
 * Locking clocks / power limits needs root — `nvtune` calls `sudo` automatically.
 * Always test tuning under load and revert with `nvtune reset` if unstable.
 
@@ -93,7 +93,7 @@ Có 2 dạng: **GUI đồ hoạ** (`nvtune-gui`, GTK4 — slider, đồ thị li
 
 ## Về "undervolt" trên Linux + NVIDIA
 
-Driver NVIDIA Linux **không cho chỉnh đường cong điện áp** (khác Afterburner Windows). Cách undervolt hiệu quả: **khoá clock GPU** (`nvidia-smi -lgc`) + **giới hạn power** (`-pl`) → GPU chạy clock đó ở điện áp thấp nhất nó cần. Thêm **clock offset** dương (cần bật `Coolbits` trong Xorg) để cùng điện áp đạt clock cao hơn. `nvtune` gói tất cả vào lệnh gọn.
+Driver NVIDIA Linux **không cho chỉnh đường cong điện áp** (khác Afterburner Windows). Cách undervolt hiệu quả: **khoá clock GPU** (`nvidia-smi -lgc`) + **giới hạn power** (`-pl`) → GPU chạy clock đó ở điện áp thấp nhất nó cần. Thêm **clock offset** dương (áp qua NVML) để cùng điện áp đạt clock cao hơn. `nvtune` gói tất cả vào lệnh gọn.
 
 ## Cài đặt
 
@@ -113,7 +113,7 @@ nvtune undervolt --clock 1800 --power 220
 
 # Chỉnh chi tiết
 nvtune set --power 200 --lock-clock 300,1800
-nvtune set --gpu-offset 100 --mem-offset 400    # offset (cần Coolbits)
+nvtune set --gpu-offset 100 --mem-offset 400    # offset (qua NVML)
 nvtune reset                                    # về stock
 
 # Profile
@@ -131,6 +131,6 @@ Nhiều GPU: thêm `-i <index>`.
 
 ## Lưu ý
 
-* **Clock offset & quạt** cần bật `Coolbits` trong Xorg (`Option "Coolbits" "28"` vào Device section NVIDIA + restart display manager) **và** GPU phải đang xuất **một màn hình thật** — màn hình hoặc cục HDMI/DP dummy plug giá rẻ. Máy headless hoặc màn ảo/CustomEDID thì driver báo `Unknown Error`. Power limit + lock clock thì luôn chạy.
+* **Clock offset & quạt** chạy qua **NVML** (`libnvidia-ml`, đi kèm driver): không cần X server, không cần `Coolbits`, **không cần cắm màn hình** — chạy được trên máy headless. Chỉ cần root (nvtune tự gọi `sudo`). `nvidia-settings` chỉ còn là fallback cho driver quá cũ — lưu ý distro hay ship `nvidia-settings` cũ hơn driver rất nhiều (510 vs 595 ở đây), lệch version làm mọi lệnh ghi fail với `Unknown Error`.
 * Khoá clock/power cần root — `nvtune` tự gọi `sudo`.
 * Luôn test khi có tải, không ổn thì `nvtune reset`.
