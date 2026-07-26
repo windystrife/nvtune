@@ -64,7 +64,26 @@ nvtune osd run -- <game/launcher>               # launch a game with the overlay
 # Steam launch options:  mangohud %command%     (toggle with Shift_R+F12)
 ```
 
-Multiple GPUs: add `-i <index>` (e.g. `nvtune -i 1 monitor`).
+## Multiple GPUs
+
+`nvtune list` prints every card with the index to pass to `-i`; the index is
+nvidia-smi's, which does **not** follow PCI bus order, so check the bus column
+rather than assuming card 0 is the one in the top slot:
+
+```bash
+nvtune list
+#   -i 0   NVIDIA GeForce RTX 2080 Ti   00000000:04:00.0   22528 MiB   250W limit   <- default
+#   -i 1   NVIDIA GeForce RTX 2080 Ti   00000000:82:00.0   22528 MiB   250W limit
+
+nvtune -i 1 monitor            # any subcommand takes -i
+```
+
+The GUI shows a card selector next to the title whenever more than one GPU is
+present (single-GPU machines see no extra control). Switching re-reads
+everything that is per-card — power and clock ranges, tuning capability — and
+clears the graph, which belongs to the card you just left. `nvtune-gui -i 1`
+opens straight onto a given card, and each launch is its own process, so you
+can watch two cards side by side.
 
 ## Notes
 
@@ -127,7 +146,25 @@ nvtune osd run -- <game>
 # Steam: đặt launch option  mangohud %command%   (bật/tắt: Shift_R+F12)
 ```
 
-Nhiều GPU: thêm `-i <index>`.
+## Nhiều GPU
+
+`nvtune list` in ra từng card kèm index để truyền vào `-i`. Index này là của
+nvidia-smi và **không** theo thứ tự bus PCI, nên hãy nhìn cột bus chứ đừng mặc
+định card 0 là card ở khe trên cùng:
+
+```bash
+nvtune list
+#   -i 0   NVIDIA GeForce RTX 2080 Ti   00000000:04:00.0   22528 MiB   250W limit   <- default
+#   -i 1   NVIDIA GeForce RTX 2080 Ti   00000000:82:00.0   22528 MiB   250W limit
+
+nvtune -i 1 monitor            # mọi subcommand đều nhận -i
+```
+
+GUI hiện ô chọn card cạnh tên GPU khi máy có nhiều hơn một card (máy 1 card
+không thấy gì thêm). Đổi card sẽ đọc lại toàn bộ thứ thuộc về từng card —
+khoảng power/clock, khả năng tune — và xoá đồ thị vì dữ liệu đó là của card
+vừa rời. `nvtune-gui -i 1` mở thẳng vào một card, và mỗi lần chạy là một tiến
+trình riêng nên bạn mở song song hai cửa sổ cho hai card được.
 
 ## Lưu ý
 

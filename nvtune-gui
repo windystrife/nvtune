@@ -16,7 +16,7 @@ from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
+from gi.repository import Gtk, GLib, Gdk, Gio, Pango  # noqa: E402
 
 NVTUNE = shutil.which("nvtune") or str(Path.home() / "nvtune" / "nvtune")
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
@@ -618,7 +618,11 @@ def main():
         ap.error(f"no GPU with index {args.gpu} "
                  f"(available: {', '.join(map(str, available))})")
     set_gpu(args.gpu)
-    app = Gtk.Application(application_id="com.windystrife.nvtune")
+    # NON_UNIQUE: without it a second launch just re-activates the running
+    # process, so -i is swallowed and the extra window shares the same global
+    # GPU. One process per window is also how you watch two cards at once.
+    app = Gtk.Application(application_id="com.windystrife.nvtune",
+                          flags=Gio.ApplicationFlags.NON_UNIQUE)
     app.connect("activate", lambda a: Win(a).present())
     app.run(None)
 
