@@ -7,6 +7,7 @@ so the console tool and the GUI stay in sync. Shows a rolling graph and
 sliders for power limit / clock lock / offsets / fan, plus profiles and the
 MangoHud in-game overlay toggle.
 """
+import argparse
 import os
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
 
 NVTUNE = shutil.which("nvtune") or str(Path.home() / "nvtune" / "nvtune")
 PROFILE_DIR = Path(os.environ.get("NVTUNE_DIR", Path.home() / ".config" / "nvtune"))
-GPU = 0
+GPU = 0  # index of the GPU being shown/tuned; the selector rebinds it (set_gpu)
 HIST = 120  # seconds of graph history
 # GDDR6: nvidia-smi reports 4x the real (GPU-Z-style) memory clock. Show the real
 # clock and treat the memory offset in the same real-clock units (the CLI scales
@@ -28,7 +29,9 @@ MEM_CLOCK_RATIO = 4
 
 
 # ------------------------------------------------------------- data helpers ----
-def nvsmi(fields, idx=GPU):
+def nvsmi(fields, idx=None):
+    # Read GPU at call time: a default of `idx=GPU` would freeze index 0 here.
+    idx = GPU if idx is None else idx
     r = subprocess.run(
         ["nvidia-smi", f"--query-gpu={','.join(fields)}",
          "--format=csv,noheader,nounits", "-i", str(idx)],
@@ -51,6 +54,24 @@ def nvtune(*args):
     r = subprocess.run([NVTUNE, "-i", str(GPU), *map(str, args)],
                        capture_output=True, text=True)
     return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def list_gpus():
+    """[(index, name), ...] for every GPU nvidia-smi can see."""
+    r = subprocess.run(["nvidia-smi", "--query-gpu=index,name",
+                        "--format=csv,noheader"], capture_output=True, text=True)
+    out = []
+    for line in r.stdout.strip().splitlines():
+        idx, _, name = line.partition(",")
+        if idx.strip().isdigit():
+            out.append((int(idx), name.strip()))
+    return out or [(0, "NVIDIA GPU")]
+
+
+def set_gpu(idx):
+    """Point every helper above at another card."""
+    global GPU
+    GPU = int(idx)
 
 
 # ------------------------------------------------------------- NVAPI temps ----
@@ -112,6 +133,10 @@ class _NvAPI:
                 if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
                     h = self.handles[i]
                     break
+            else:
+                # A specific card was asked for and NVAPI does not have it.
+                # Falling back to handles[0] would report another GPU's temps.
+                return None
         s = self.TH(version=self.ver, mask=self.mask)
         if self._therm(h, C.byref(s)) != 0:
             return None
@@ -132,7 +157,7 @@ def nvapi_temps(bus=None):
 
 def _bus_of(bus_id):
     try:
-        return int(bus_id.split(":")[-3], 16)
+        return int(bus_id.split(":")[-2], 16)
     except (ValueError, IndexError, AttributeError):
         return None
 
@@ -150,6 +175,12 @@ class Graph(Gtk.DrawingArea):
 
     def push(self, temp, powr_pct, util):
         self.temp.append(temp); self.powr.append(powr_pct); self.util.append(util)
+        self.queue_draw()
+
+    def reset(self):
+        """Drop the history — after a GPU switch it belongs to the other card."""
+        for d in (self.temp, self.powr, self.util):
+            d.clear(); d.extend([0] * HIST)
         self.queue_draw()
 
     def _draw(self, area, cr, w, h):
@@ -258,11 +289,23 @@ class Win(Gtk.ApplicationWindow):
         scroller.set_child(root)
         self.set_child(scroller)
 
-        info = nvsmi(["name"])
-        title = Gtk.Label(xalign=0)
-        title.set_markup(f"<b>{info.get('name', 'NVIDIA GPU')}</b>")
-        title.add_css_class("title-2")
-        root.append(title)
+        # header: card name, plus a selector when there is more than one card
+        self.gpus = list_gpus()
+        hdr = Gtk.Box(spacing=10)
+        self.title = Gtk.Label(xalign=0)
+        self.title.add_css_class("title-2")
+        self.title.set_hexpand(True)
+        hdr.append(self.title)
+        if len(self.gpus) > 1:
+            self.gpu_dd = Gtk.DropDown.new_from_strings(
+                [f"GPU {i}: {n}" for i, n in self.gpus])
+            self.gpu_dd.set_selected(
+                next((k for k, (i, _) in enumerate(self.gpus) if i == GPU), 0))
+            self.gpu_dd.set_tooltip_text("Which card to monitor and tune")
+            self.gpu_dd.connect("notify::selected", self.on_gpu_changed)
+            hdr.append(self.gpu_dd)
+        root.append(hdr)
+        self._set_title()
 
         # live readout cards
         self.readout = {}
@@ -376,6 +419,10 @@ class Win(Gtk.ApplicationWindow):
         f = Gtk.Frame(); f.set_child(self.graph)
         return f
 
+    def _set_title(self):
+        name = nvsmi(["name"]).get("name", "NVIDIA GPU")
+        self.title.set_markup(f"<b>{GLib.markup_escape_text(name)}</b>")
+
     def _curve_clock(self, mhz):
         """Curve callback: dragging the line sets the locked target clock."""
         lo, hi = self._clock_range()
@@ -478,6 +525,39 @@ class Win(Gtk.ApplicationWindow):
         self.status.set_markup(
             f"<span foreground='{'#4dcc66' if ok else '#e05a5a'}'>{GLib.markup_escape_text(msg)}</span>")
 
+    def on_gpu_changed(self, dd, *_):
+        """Repoint the whole window at another card. Everything currently on
+        screen was read from the old one, so re-probe rather than carry it
+        over: ranges, limits and tuning capability are all per-GPU."""
+        sel = dd.get_selected()
+        if sel < 0 or sel >= len(self.gpus):
+            return
+        idx, name = self.gpus[sel]
+        set_gpu(idx)
+        self.can_tune = self._tuning_available()
+
+        self._set_title()
+        pmin, pmax = self._power_range()
+        padj = self.s_power.get_adjustment()
+        padj.set_lower(pmin); padj.set_upper(pmax)
+        self.s_power.set_value(num(nvsmi(["power.limit"]).get("power.limit"), pmax))
+        cmin, cmax = self._clock_range()
+        cadj = self.s_clock.get_adjustment()
+        cadj.set_lower(cmin); cadj.set_upper(cmax)
+        self.s_clock.set_value((cmin + cmax) // 2)
+
+        self.lock_on.set_active(False)
+        self.fan_on.set_active(False)
+        self.s_goff.set_value(0)
+        self.s_moff.set_value(0)
+        for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
+            w.set_sensitive(self.can_tune)
+
+        self.graph.reset()
+        self._sync_curve()
+        self.refresh()
+        self._set_status(f"Now showing GPU {idx} — {name}")
+
     def on_apply(self, _):
         args = ["set", "--power", int(self.s_power.get_value())]
         if self.lock_on.get_active():
@@ -529,6 +609,15 @@ class Win(Gtk.ApplicationWindow):
 
 
 def main():
+    ap = argparse.ArgumentParser(description="nvtune — GTK4 front-end")
+    ap.add_argument("-i", "--gpu", type=int, default=0,
+                    help="GPU index to start on (default 0)")
+    args = ap.parse_args()
+    available = [i for i, _ in list_gpus()]
+    if args.gpu not in available:
+        ap.error(f"no GPU with index {args.gpu} "
+                 f"(available: {', '.join(map(str, available))})")
+    set_gpu(args.gpu)
     app = Gtk.Application(application_id="com.windystrife.nvtune")
     app.connect("activate", lambda a: Win(a).present())
     app.run(None)

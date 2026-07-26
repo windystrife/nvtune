@@ -130,6 +130,10 @@ class _NvAPI:
                 if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
                     h = self.handles[i]
                     break
+            else:
+                # A specific card was asked for and NVAPI does not have it.
+                # Falling back to handles[0] would report another GPU's temps.
+                return None
         s = self.TH(version=self.ver, mask=self.mask)
         if self._therm(h, C.byref(s)) != 0:
             return None
@@ -147,9 +151,12 @@ def nvapi_temps(bus=None):
     return _nvapi.temps(bus)
 
 def _bus_of(bus_id):
-    """Parse nvidia-smi pci.bus_id ('00000000:82:00.0') -> bus number int (0x82)."""
+    """Parse nvidia-smi pci.bus_id ('00000000:82:00.0') -> bus number int (0x82).
+
+    The field is domain:bus:device.function, so the bus is the second-to-last
+    component; [-3] would pick the domain (always 0) instead."""
     try:
-        return int(bus_id.split(":")[-3], 16)
+        return int(bus_id.split(":")[-2], 16)
     except (ValueError, IndexError, AttributeError):
         return None
 
@@ -186,6 +193,21 @@ def _num(x, default=0.0):
         return float(x)
     except (TypeError, ValueError):
         return default
+
+# ------------------------------------------------------------------- list ----
+
+def cmd_list(args):
+    """Show every GPU with the index to pass to -i, so multi-card boxes are
+    not a guessing game."""
+    require_nvsmi()
+    for idx, name in list_gpus():
+        d = query(idx)
+        bus = d.get("pci.bus_id", "?")
+        print(f"  -i {idx}   {name}   {bus}   "
+              f"{_num(d.get('memory.total')):.0f} MiB   "
+              f"{_num(d.get('power.limit')):.0f}W limit"
+              + ("   <- default" if idx == args.gpu else ""))
+    return 0
 
 # ---------------------------------------------------------------- monitor ----
 
@@ -592,6 +614,9 @@ def build_parser():
         description="MSI-Afterburner-style undervolt / monitor / OSD for NVIDIA on Linux")
     p.add_argument("-i", "--gpu", type=int, default=0, help="GPU index (default 0)")
     sub = p.add_subparsers(dest="cmd")
+
+    ls = sub.add_parser("list", help="list the GPUs nvtune can drive")
+    ls.set_defaults(func=cmd_list)
 
     m = sub.add_parser("monitor", help="live TUI dashboard")
     m.add_argument("--interval", type=float, default=1.0)
