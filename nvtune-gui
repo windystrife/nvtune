@@ -74,6 +74,37 @@ def set_gpu(idx):
     GPU = int(idx)
 
 
+def nvml_offsets(idx):
+    """Clock offsets the driver currently has applied, in this GUI's units.
+
+    Offsets only. NVML also exposes fan policy and target speed, but on this
+    driver both report a card as automatic while a manual speed is applied, so
+    they cannot be trusted; there is no getter for locked clocks at all. What
+    cannot be read back is remembered per card instead (see Win._snapshot).
+    """
+    out = {}
+    try:
+        import ctypes
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        if lib.nvmlInit_v2() != 0:
+            return out
+        try:
+            h = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(idx, ctypes.byref(h)) != 0:
+                return out
+            v = ctypes.c_int()
+            if lib.nvmlDeviceGetGpcClkVfOffset(h, ctypes.byref(v)) == 0:
+                out["goff"] = v.value
+            v = ctypes.c_int()
+            if lib.nvmlDeviceGetMemClkVfOffset(h, ctypes.byref(v)) == 0:
+                out["moff"] = v.value // MEM_CLOCK_RATIO   # CLI scales on the way in
+        finally:
+            lib.nvmlShutdown()
+    except OSError:
+        pass
+    return out
+
+
 # ------------------------------------------------------------- NVAPI temps ----
 # Hotspot + VRAM temperature are not exposed by nvidia-smi/NVML on GeForce; read
 # them from NVAPI (libnvidia-api.so.1, driver >=555): thermal index 9 = hotspot,
@@ -409,7 +440,14 @@ class Win(Gtk.ApplicationWindow):
         self.status = Gtk.Label(xalign=0); self.status.add_css_class("dim-label")
         root.append(self.status)
 
+        # Per-card control state. Switching away stores what is on screen and
+        # switching back restores it, so an applied setting does not vanish
+        # just because you looked at the other card.
+        self.gpu_state = {}
+        self.cur_gpu = GPU
+
         self._css()
+        self._load_hw_state()
         self.refresh()
         GLib.timeout_add(1000, self.refresh)
 
@@ -474,6 +512,49 @@ class Win(Gtk.ApplicationWindow):
         cmax = int(num(d.get("clocks.max.gr"), 2100))
         return 300, cmax
 
+    # ---- per-card control state ----
+    def _apply_ranges(self):
+        """Re-point the sliders at the current card's limits. Must run before
+        restoring values: anything outside the adjustment gets clamped."""
+        pmin, pmax = self._power_range()
+        padj = self.s_power.get_adjustment()
+        padj.set_lower(pmin); padj.set_upper(pmax)
+        cmin, cmax = self._clock_range()
+        cadj = self.s_clock.get_adjustment()
+        cadj.set_lower(cmin); cadj.set_upper(cmax)
+        return pmax, (cmin + cmax) // 2
+
+    def _load_hw_state(self):
+        """First look at a card: show what it actually has applied. Locked
+        clock and fan mode cannot be read back (see nvml_offsets), so they
+        start off rather than claiming a state we did not verify."""
+        pmax, cmid = self._apply_ranges()
+        self.s_power.set_value(num(nvsmi(["power.limit"]).get("power.limit"), pmax))
+        self.s_clock.set_value(cmid)
+        off = nvml_offsets(GPU)
+        self.s_goff.set_value(off.get("goff", 0))
+        self.s_moff.set_value(off.get("moff", 0))
+        self.lock_on.set_active(False)
+        self.fan_on.set_active(False)
+
+    def _snapshot(self):
+        return {"power": self.s_power.get_value(),
+                "lock_on": self.lock_on.get_active(),
+                "clock": self.s_clock.get_value(),
+                "goff": self.s_goff.get_value(),
+                "moff": self.s_moff.get_value(),
+                "fan_on": self.fan_on.get_active(),
+                "fan": self.s_fan.get_value()}
+
+    def _restore(self, st):
+        self.s_power.set_value(st["power"])
+        self.s_clock.set_value(st["clock"])
+        self.s_goff.set_value(st["goff"])
+        self.s_moff.set_value(st["moff"])
+        self.s_fan.set_value(st["fan"])
+        self.lock_on.set_active(st["lock_on"])
+        self.fan_on.set_active(st["fan_on"])
+
     def _tuning_available(self):
         """Can we drive fan + clock offsets? NVML (ships with the driver, needs
         no X/Coolbits/display) is the real path; fall back to probing
@@ -533,23 +614,20 @@ class Win(Gtk.ApplicationWindow):
         if sel < 0 or sel >= len(self.gpus):
             return
         idx, name = self.gpus[sel]
+        if idx == self.cur_gpu:
+            return
+        self.gpu_state[self.cur_gpu] = self._snapshot()   # keep what is on screen
         set_gpu(idx)
+        self.cur_gpu = idx
         self.can_tune = self._tuning_available()
 
         self._set_title()
-        pmin, pmax = self._power_range()
-        padj = self.s_power.get_adjustment()
-        padj.set_lower(pmin); padj.set_upper(pmax)
-        self.s_power.set_value(num(nvsmi(["power.limit"]).get("power.limit"), pmax))
-        cmin, cmax = self._clock_range()
-        cadj = self.s_clock.get_adjustment()
-        cadj.set_lower(cmin); cadj.set_upper(cmax)
-        self.s_clock.set_value((cmin + cmax) // 2)
-
-        self.lock_on.set_active(False)
-        self.fan_on.set_active(False)
-        self.s_goff.set_value(0)
-        self.s_moff.set_value(0)
+        saved = self.gpu_state.get(idx)
+        if saved:
+            self._apply_ranges()
+            self._restore(saved)
+        else:
+            self._load_hw_state()
         for w in (self.s_goff, self.s_moff, self.s_fan, self.fan_on):
             w.set_sensitive(self.can_tune)
 
