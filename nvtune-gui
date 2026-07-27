@@ -457,6 +457,8 @@ class Win(Gtk.ApplicationWindow):
         self._load_hw_state()
         self.refresh()
         GLib.timeout_add(1000, self.refresh)
+        self._hw_seen = None
+        GLib.timeout_add(3000, self._poll_external)
 
     # ---- ui builders ----
     def _make_graph(self):
@@ -663,6 +665,47 @@ class Win(Gtk.ApplicationWindow):
         self.refresh()
         self._set_status(f"Now showing GPU {idx} — {name}")
 
+    def _hw_fingerprint(self):
+        """The applied settings, as a comparable tuple. Used to notice changes
+        that came from outside this window (the CLI, a profile, another copy of
+        the GUI) without disturbing sliders the user is still dragging."""
+        d = nvsmi(["power.limit", "clocks.gr", "utilization.gpu"])
+        off = nvml_offsets(GPU)
+        return (round(num(d.get("power.limit")), 1),
+                self._detect_lock(),
+                off.get("goff"), off.get("moff"),
+                off.get("fan_manual"), off.get("fan"))
+
+    def _resync_after_apply(self):
+        """Re-read the card once a change has landed, so the controls show what
+        is actually applied rather than what was asked for. Deferred a moment
+        because the driver reports fan speed only after it has ramped."""
+        def later():
+            self._load_hw_state()
+            self.gpu_state[self.cur_gpu] = self._snapshot()   # keep the cache honest
+            self._sync_curve()
+            self._hw_seen = self._hw_fingerprint()
+            return False
+        GLib.timeout_add(900, later)
+
+    def _poll_external(self):
+        """Pick up settings applied outside this window. Only acts when the
+        card's applied state actually changed, so sliders being dragged toward
+        an un-applied value are left alone."""
+        try:
+            fp = self._hw_fingerprint()
+        except Exception:
+            return True
+        if getattr(self, "_hw_seen", None) is None:
+            self._hw_seen = fp
+        elif fp != self._hw_seen:
+            self._hw_seen = fp
+            self._load_hw_state()
+            self.gpu_state[self.cur_gpu] = self._snapshot()
+            self._sync_curve()
+            self._set_status("Picked up settings applied outside this window")
+        return True
+
     def on_apply(self, _):
         args = ["set", "--power", int(self.s_power.get_value())]
         if self.lock_on.get_active():
@@ -673,11 +716,15 @@ class Win(Gtk.ApplicationWindow):
             if self.fan_on.get_active(): args += ["--fan", int(self.s_fan.get_value())]
         ok, out = nvtune(*args)
         self._set_status("Applied ✓" if ok else f"Apply failed: {out.splitlines()[-1] if out else ''}", ok)
+        if ok:
+            self._resync_after_apply()
 
     def on_reset(self, _):
         ok, out = nvtune("reset")
         self.lock_on.set_active(False)
         self._set_status("Reset to stock ✓" if ok else "Reset failed", ok)
+        if ok:
+            self._resync_after_apply()
 
     def on_save(self, _):
         name = self.prof_name.get_text().strip()
@@ -700,6 +747,8 @@ class Win(Gtk.ApplicationWindow):
         name = sel.get_string()
         ok, out = nvtune("profile", "apply", name)
         self._set_status(f"Applied profile '{name}' ✓" if ok else "Apply failed", ok)
+        if ok:
+            self._resync_after_apply()
 
     def on_osd(self, btn):
         btn.set_sensitive(False)
