@@ -75,12 +75,13 @@ def set_gpu(idx):
 
 
 def nvml_offsets(idx):
-    """Clock offsets the driver currently has applied, in this GUI's units.
+    """What the driver currently has applied on a card, in this GUI's units.
 
-    Offsets only. NVML also exposes fan policy and target speed, but on this
-    driver both report a card as automatic while a manual speed is applied, so
-    they cannot be trusted; there is no getter for locked clocks at all. What
-    cannot be read back is remembered per card instead (see Win._snapshot).
+    Offsets and fan both read back through NVML: GetFanControlPolicy_v2
+    reports 1 while a manual speed is applied and 0 once the card is handed
+    back to its own curve, and GetFanSpeed_v2 returns the applied percentage.
+    Locked clocks are the one thing NVML has no getter for; see
+    Win._detect_lock for how that is inferred instead.
     """
     out = {}
     try:
@@ -98,6 +99,12 @@ def nvml_offsets(idx):
             v = ctypes.c_int()
             if lib.nvmlDeviceGetMemClkVfOffset(h, ctypes.byref(v)) == 0:
                 out["moff"] = v.value // MEM_CLOCK_RATIO   # CLI scales on the way in
+            pol = ctypes.c_uint()
+            if lib.nvmlDeviceGetFanControlPolicy_v2(h, 0, ctypes.byref(pol)) == 0:
+                out["fan_manual"] = (pol.value == 1)
+            sp = ctypes.c_uint()
+            if lib.nvmlDeviceGetFanSpeed_v2(h, 0, ctypes.byref(sp)) == 0:
+                out["fan"] = sp.value
         finally:
             lib.nvmlShutdown()
     except OSError:
@@ -524,18 +531,38 @@ class Win(Gtk.ApplicationWindow):
         cadj.set_lower(cmin); cadj.set_upper(cmax)
         return pmax, (cmin + cmax) // 2
 
+    @staticmethod
+    def _detect_lock():
+        """Guess whether a clock lock is applied, and at what value.
+
+        NVML has no getter for locked clocks, but a locked card gives itself
+        away: left idle it stays pinned at the locked speed instead of dropping
+        to its ~300 MHz idle clock. So only trust this while the GPU is quiet —
+        under load a high clock proves nothing.
+        """
+        d = nvsmi(["clocks.gr", "utilization.gpu"])
+        clk, util = num(d.get("clocks.gr")), num(d.get("utilization.gpu"))
+        if util <= 30 and clk >= 600:
+            return int(clk)
+        return None
+
     def _load_hw_state(self):
-        """First look at a card: show what it actually has applied. Locked
-        clock and fan mode cannot be read back (see nvml_offsets), so they
-        start off rather than claiming a state we did not verify."""
+        """First look at a card: show what it actually has applied, so the
+        sliders match reality instead of resetting to defaults."""
         pmax, cmid = self._apply_ranges()
         self.s_power.set_value(num(nvsmi(["power.limit"]).get("power.limit"), pmax))
-        self.s_clock.set_value(cmid)
         off = nvml_offsets(GPU)
         self.s_goff.set_value(off.get("goff", 0))
         self.s_moff.set_value(off.get("moff", 0))
-        self.lock_on.set_active(False)
-        self.fan_on.set_active(False)
+
+        locked = self._detect_lock()
+        self.s_clock.set_value(locked if locked else cmid)
+        self.lock_on.set_active(bool(locked))
+
+        manual = off.get("fan_manual", False)
+        self.fan_on.set_active(manual)
+        if off.get("fan") is not None:
+            self.s_fan.set_value(off["fan"])
 
     def _snapshot(self):
         return {"power": self.s_power.get_value(),
