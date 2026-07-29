@@ -78,6 +78,7 @@ def require_nvsmi():
 
 class _NvAPI:
     Q_INIT, Q_ENUM, Q_BUSID, Q_THERM = 0x0150e828, 0xe5ac921f, 0x1be0b8e5, 0x65fe3aad
+    Q_VOLT = 0x465f9bcf          # NvAPI_GPU_ClientVoltRailsGetStatus
 
     def __init__(self):
         self.ok = False
@@ -101,6 +102,12 @@ class _NvAPI:
             self._enum  = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_ENUM))
             self._busid = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(C.c_uint))(qi(self.Q_BUSID))
             self._therm = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(TH))(qi(self.Q_THERM))
+            # Voltage is a bonus: if this entry point is missing the rest
+            # of the class must still work, so it is bound defensively.
+            try:
+                self._volt = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p)(qi(self.Q_VOLT))
+            except OSError:
+                self._volt = None
             if self._init() != 0:
                 raise OSError("NvAPI_Initialize failed")
             self.handles = (C.c_void_p * 64)()
@@ -118,6 +125,39 @@ class _NvAPI:
             self.ok = True
         except Exception:
             self.ok = False
+
+    def _handle_for(self, bus):
+        """Resolve a PCI bus number to an NVAPI handle, or None if absent."""
+        if bus is None:
+            return self.handles[0]
+        C = self.C
+        for i in range(self.count.value):
+            b = C.c_uint(0)
+            if self._busid(self.handles[i], C.byref(b)) == 0 and b.value == bus:
+                return self.handles[i]
+        return None
+
+    def voltage(self, bus=None):
+        """Core voltage in volts, or None.
+
+        NV_VOLT_STATUS is 76 bytes at struct major 1 on this driver, and the
+        microvolt reading lands at word[10]. Verified against load rather than
+        assumed: the value tracks the 6.25 mV steps the card actually takes.
+        """
+        if not self.ok or not getattr(self, "_volt", None):
+            return None
+        h = self._handle_for(bus)
+        if h is None:
+            return None
+        C = self.C
+        buf = (C.c_ubyte * 256)()
+        C.memset(buf, 0, 256)
+        C.cast(buf, C.POINTER(C.c_uint))[0] = 76 | (1 << 16)
+        if self._volt(h, buf) != 0:
+            return None
+        uv = C.cast(buf, C.POINTER(C.c_uint))[10]
+        # A plausible core voltage; anything outside this is a struct mismatch.
+        return uv / 1e6 if 400_000 <= uv <= 1_500_000 else None
 
     def temps(self, bus=None):
         if not self.ok:
@@ -149,6 +189,14 @@ def nvapi_temps(bus=None):
     if _nvapi is None:
         _nvapi = _NvAPI()
     return _nvapi.temps(bus)
+
+def nvapi_voltage(bus=None):
+    """Return core voltage in volts for the GPU on PCI `bus` (int), or None."""
+    global _nvapi
+    if _nvapi is None:
+        _nvapi = _NvAPI()
+    return _nvapi.voltage(bus)
+
 
 def _bus_of(bus_id):
     """Parse nvidia-smi pci.bus_id ('00000000:82:00.0') -> bus number int (0x82).
@@ -223,7 +271,7 @@ def cmd_monitor(args):
     def render():
         t = Table(box=box.SIMPLE_HEAVY, title="nvtune — NVIDIA live monitor",
                   title_style="bold cyan", expand=True)
-        for col in ("GPU", "Temp", "Hot", "Tmem", "Power", "GPU%", "Mem%",
+        for col in ("GPU", "Temp", "Hot", "Tmem", "Power", "Volt", "GPU%", "Mem%",
                     "Core clk", "Mem clk", "VRAM", "Fan", "Pstate"):
             t.add_column(col, justify="right")
         for idx, _ in list_gpus():
@@ -236,9 +284,12 @@ def cmd_monitor(args):
                     return "—"
                 c = "green" if v < warn else "yellow" if v < hot else "red"
                 return f"[{c}]{v:.0f}°C[/]"
-            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
+            bus = _bus_of(d.get("pci.bus_id", ""))
+            nv = nvapi_temps(bus) or {}
             hot_c = _tcell(nv.get("hotspot"), 85, 100)
             tmem_c = _tcell(nv.get("vram"), 85, 95)
+            mv = nvapi_voltage(bus)
+            volt_c = f"{mv:.3f}V" if mv is not None else "—"
 
             t.add_row(
                 f"{d['index']} {d['name'].replace('NVIDIA ', '')[:18]}",
@@ -246,6 +297,7 @@ def cmd_monitor(args):
                 hot_c,
                 tmem_c,
                 f"{_num(d['power.draw']):.0f}/{_num(d['power.limit']):.0f}W",
+                volt_c,
                 f"{_num(d['utilization.gpu']):.0f}%",
                 f"{_num(d['utilization.memory']):.0f}%",
                 f"{_num(d['clocks.gr']):.0f}/{_num(d['clocks.max.gr']):.0f}",
@@ -268,10 +320,14 @@ def _monitor_plain(args):
     try:
         while True:
             d = query(args.gpu)
-            nv = nvapi_temps(_bus_of(d.get("pci.bus_id", ""))) or {}
+            bus = _bus_of(d.get("pci.bus_id", ""))
+            nv = nvapi_temps(bus) or {}
             hs = nv.get("hotspot")
             vt = nv.get("vram")
+            mv = nvapi_voltage(bus)
             extra = ""
+            if mv is not None:
+                extra += f"  {mv:.3f}V"
             if hs is not None:
                 extra += f"  hot {hs:.0f}°C"
             if vt is not None:
